@@ -266,6 +266,13 @@ function userText(node) {
     }
     if (item.tagName === 'BR') return '\n';
     const text = [...item.childNodes].map(read).join('');
+    // Rendered inline code drops its Markdown delimiters. Reconstruct only
+    // single-backtick spans from CODE structure; never strip prompt syntax
+    // or treat PRE/code-block content as an inline span.
+    if (item.tagName === 'CODE' && !item.closest('pre, [data-code-block], .cm-content')) {
+      if (!text || text.includes('`')) throw new PageSafetyError('无法严格还原网页用户消息的行内代码，已停止转发');
+      return '`' + text + '`';
+    }
     return ['P', 'DIV', 'LI', 'BLOCKQUOTE'].includes(item.tagName) ? text + '\n' : text;
   };
   return normalizeText(read(root));
