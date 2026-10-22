@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { JSDOM } from 'jsdom';
+import { observationLines } from '../extension/background-observation.js';
 
 const html = await readFile(new URL('../extension/options.html', import.meta.url), 'utf8');
 const source = await readFile(new URL('../extension/options.js', import.meta.url), 'utf8');
@@ -63,7 +64,7 @@ async function setup(initialPlatform = 'qq', initial = {}) {
       case 'options:save-words': state.words = Array.from(message.words); data = { count: state.words.length }; break;
       case 'options:reply-style':
         assert.equal(message.platform, 'feishu'); state.replyStyle = message.replyStyle; break;
-      case 'options:clear-notices': state.localNotices = []; break;
+      case 'options:clear-notices': state.localNotices = []; delete state.backgroundObservation; break;
       case 'options:clear-history': { const before = state.jobs.length; state.jobs = state.jobs.filter(job => !['completed', 'failed', 'cancelled'].includes(job.state)); data = { ok: true, count: before - state.jobs.length }; break; }
       case 'options:cancel-job': {
         const job = state.jobs.find(job => job.id === message.jobId);
@@ -81,7 +82,8 @@ async function setup(initialPlatform = 'qq', initial = {}) {
     }
     return { ok: true, data };
   } } };
-  window.eval(source); await settle();
+  window.__observations = { observationLines };
+  window.eval(source.replace("import { observationLines } from './background-observation.js';", 'const { observationLines } = globalThis.__observations;')); await settle();
   const $ = id => window.document.getElementById(id);
   return {
     $, window, calls, states, profiles, hooks, close: () => window.close(),
@@ -800,4 +802,22 @@ test('header logo follows the configured assistant and is bundled locally', asyn
 test('local failure diagnostics render as readable text and clear with the same notices', async()=>{
   const x=await setup('qq',{qq:{localNotices:[{tabId:7,at:1800000000000,error:'cloudflare_challenge',idleRefreshMs:650000,idleRefreshResumed:true,diagnostics:{pageAgeMs:20000,bridgeIdleMs:650000,visibility:'hidden',phase:'challenge-recovery'}}]}});
   try{assert.match(x.$('notices').textContent,/桥接闲置 650 秒.*页面运行 20 秒.*后台.*错误恢复.*发送前刷新已恢复/);await x.click('clear-notices');assert.doesNotMatch(x.$('notices').textContent,/本地诊断/);}finally{x.close();}
+});
+
+test('Qwen background observations display metadata, survive polling and clear only their channel', async () => {
+  const sample = { elapsedMs: 5000, gapMs: 1000, wakeAgeMs: 0, bodyChars: 222, bodyCount: 1, footerCount: 1,
+    hidden: true, generating: false, complete: true, candidate: true, text: 'PRIVATE ANSWER' };
+  const x = await setup('qq', { qwen: { qq: { backgroundObservation: { at: 1800000000000, receivedAt: 1800000000000, tabId: 10, samples: [sample] } } } });
+  try {
+    assert.doesNotMatch(x.$('notices').textContent, /Qwen 后台观察/);
+    await x.view('qwen');
+    assert.match(x.$('notices').textContent, /Qwen 后台观察.*后台.*正文 222 字.*完成校验通过/);
+    assert.doesNotMatch(x.$('notices').textContent, /PRIVATE ANSWER/);
+    assert.match(x.$('notices').textContent, /扩展收到最终答案.*群内送达结果见任务记录/);
+    assert.equal(x.$('clear-notices').disabled, false);
+    await x.switchTo('feishu'); assert.doesNotMatch(x.$('notices').textContent, /Qwen 后台观察/);
+    await x.switchTo('qq'); await x.poll(); assert.match(x.$('notices').textContent, /正文 222 字/);
+    await x.click('clear-notices'); assert.doesNotMatch(x.$('notices').textContent, /Qwen 后台观察/);
+    assert.equal(x.$('clear-notices').disabled, true);
+  } finally { x.close(); }
 });

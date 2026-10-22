@@ -69,7 +69,7 @@ export function createBrowserQQAdapter({ appId, appSecret, onMessage, onState = 
   const requests = new Set();
   let active = false; let epoch = 0; let socket; let ready = false; let starting;
   let token; let tokenTask; let tokenTimer; let heartbeatTimer; let reconnectTimer; let handshakeTimer;
-  let attempts = 0; let awaitingAck = false; let sessionId; let sequence = null;
+  let attempts = 0; let awaitingAck = false; let sessionId; let sequence = null; let reconnectBlocked = false;
   let incoming = Promise.resolve(); let outbound = Promise.resolve();
   function current(generation) { if (!active || generation !== epoch) throw new QQTransportError('QQ 连接已停止', { retryable: false, code: 'stopped' }); }
   function connected(generation) { current(generation); if (!ready) throw new QQTransportError('QQ 尚未完成连接', { code: 'not_ready' }); }
@@ -81,7 +81,7 @@ export function createBrowserQQAdapter({ appId, appSecret, onMessage, onState = 
   function clean(error) { return error instanceof QQTransportError ? error : new QQTransportError('QQ 连接或接口请求失败，请检查网络和应用配置'); }
   function report(state, error) { try { onState({ state, ...(error ? { error: clean(error).message } : {}) }); } catch {} }
   function isCurrent(ws, generation) { return active && generation === epoch && ws === socket; }
-  function closeSocket(ws) { try { ws?.close(); } catch {} }
+  function closeSocket(ws) { try { if (ws && ws.readyState < 2) ws.close(); } catch {} }
   function clearConnectionTimers() { cancel(heartbeatTimer); cancel(handshakeTimer); heartbeatTimer = handshakeTimer = undefined; awaitingAck = false; }
   async function readBounded(response, limit) {
     if (Number(response.headers.get('content-length')) > limit) throw invalid('QQ 响应超过允许大小');
@@ -172,8 +172,12 @@ export function createBrowserQQAdapter({ appId, appSecret, onMessage, onState = 
     ws.send(JSON.stringify(payload));
   }
   function reconnect(generation, error) {
-    if (!active || generation !== epoch || reconnectTimer !== undefined) return;
-    if (error?.retryable === false) { report('error', error); return; }
+    if (!active || generation !== epoch) return;
+    if (error?.retryable === false) {
+      reconnectBlocked = true; cancel(reconnectTimer); reconnectTimer = undefined;
+      report('error', error); return;
+    }
+    if (reconnectBlocked || reconnectTimer !== undefined) return;
     report('reconnecting', error ?? new QQTransportError('QQ 长连接已断开，正在自动重连'));
     const delay = Math.min(60000, 1000 * 2 ** Math.min(attempts++, 6)) + Math.floor(random() * 1000);
     reconnectTimer = schedule(() => { reconnectTimer = undefined; connect(generation).catch(next => reconnect(generation, clean(next))); }, delay);
@@ -196,10 +200,16 @@ export function createBrowserQQAdapter({ appId, appSecret, onMessage, onState = 
       const ws = new Socket(endpoint); socket = ws; ready = false;
       let settled = false; let hello = false; let failureCause; let accepting = true;
       const settle = error => { if (settled) return; settled = true; error ? reject(error) : resolve(); };
-      const fail = error => { accepting = false; failureCause = clean(error); settle(failureCause); closeSocket(ws); };
+      const fail = error => {
+        if (!isCurrent(ws, generation) || !accepting) return;
+        // Native close may arrive later. Revoke this connection immediately;
+        // its timers and queued events must not outlive a replacement socket.
+        accepting = false; ready = false; clearConnectionTimers(); failureCause = clean(error);
+        closeSocket(ws); settle(failureCause); reconnect(generation, failureCause);
+      };
       handshakeTimer = schedule(() => fail(new QQTransportError('QQ 长连接握手超时')), timeoutMs);
       ws.addEventListener('message', event => {
-        if (!isCurrent(ws, generation)) return;
+        if (!isCurrent(ws, generation) || !accepting) return;
         let payload;
         try {
           if (typeof event.data !== 'string' || event.data.length > 2 * 1024 * 1024) throw invalid('QQ 长连接数据无效');
@@ -258,7 +268,7 @@ export function createBrowserQQAdapter({ appId, appSecret, onMessage, onState = 
   }
   function start() {
     if (active) return starting ?? Promise.resolve();
-    active = true; const generation = ++epoch; report('connecting');
+    active = true; reconnectBlocked = false; const generation = ++epoch; report('connecting');
     const task = connect(generation).catch(error => { reconnect(generation, clean(error)); throw clean(error); });
     starting = task; task.finally(() => { if (starting === task) starting = null; }).catch(() => {});
     return task;

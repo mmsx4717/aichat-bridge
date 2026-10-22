@@ -1,5 +1,6 @@
 import { ASSISTANTS, ASSISTANT_NAMES, ASSISTANT_ORIGINS, conversationUrl, assistantId, assistantForUrl, safeError, isOptionsSender, validSession, resultTiming, normalizeText, validChallengeCheckpoint, pageDiagnostics } from './shared.js';
 import { decodeImagePayload, validateInputImages, MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES } from './dom.js';
+import { sanitizeObservation } from './background-observation.js';
 const JOB_PREFIX = 'bot.bridge.job.';
 const NOTICE_PREFIX = 'bot.bridge.notice.';
 const TAB_PROTECTION_PREFIX = 'bot.bridge.tab-protection.';
@@ -356,6 +357,16 @@ async function content(message, sender) {
       });
     }
     if (!existing || existing.id !== message.jobId || existing.sessionId !== message.sessionId || existing.conversationUrl !== url) throw new Error('任务与当前页面不匹配，已阻止操作');
+    if (message.type === 'bridge:qwen-observation') {
+      if (assistant !== 'qwen' || existing.state !== 'started' || existing.expiresAt <= Date.now()) throw new Error('后台观察不属于当前执行中的 Qwen 任务');
+      const samples = sanitizeObservation(message.samples);
+      if (!samples) throw new Error('后台观察数据无效');
+      // One latest record per channel, local only; never included in bot API data.
+      await chrome.storage.local.set({ ['bot.bridge.observation.qwen.' + existing.platform]: {
+        at: Date.now(), tabId: tab.id, jobId: existing.id, samples,
+      } });
+      return { ok: true };
+    }
     if (message.type === 'bridge:idle-prepare') {
       const diagnostics = pageDiagnostics(message.diagnostics);
       if (assistant !== 'chatgpt' || existing.state !== 'leased' || existing.idleRefresh || existing.expiresAt - Date.now() < 10000 ||
@@ -436,6 +447,15 @@ async function content(message, sender) {
       delete existing.challengeRecovery; delete existing.promptDigest;
       if (!existing.timing) { const timing = resultTiming(message.timing); if (timing) existing.timing = timing; }
       await putJob(existing);
+      if (assistant === 'qwen') {
+        const samples = sanitizeObservation(message.observation);
+        if (samples) {
+          const receivedAt = Date.now();
+          await chrome.storage.local.set({ ['bot.bridge.observation.qwen.' + existing.platform]: {
+            at: receivedAt, receivedAt, tabId: tab.id, jobId: existing.id, samples,
+          } }).catch(() => {}); // Observation failure never blocks answer delivery.
+        }
+      }
       await releasePageResources(existing);
       try { return await deliver(existing); }
       catch {
@@ -527,6 +547,7 @@ async function options(message) {
       const platform = message.platform === undefined ? (await api('/v1/status', { assistant })).platform : await activePlatform(message.platform, assistant);
       const all = await chrome.storage.local.get(null);
       await chrome.storage.local.remove(Object.keys(all).filter(k => k.startsWith(noticePrefix(platform, assistant))));
+      if (assistant === 'qwen') await chrome.storage.local.remove('bot.bridge.observation.qwen.' + platform);
       return { ok: true };
     });
   }
@@ -538,6 +559,12 @@ async function options(message) {
     state.localNotices = Object.entries(all).filter(([k]) => k.startsWith(noticePrefix(state.platform, assistant))).map(([, v]) => v)
       .filter(notice => notice && typeof notice.error === 'string')
       .sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0)).slice(0, 20);
+    if (assistant === 'qwen') {
+      const record = all['bot.bridge.observation.qwen.' + state.platform];
+      const samples = sanitizeObservation(record?.samples);
+      if (samples) state.backgroundObservation = { at: record.at, tabId: record.tabId, samples,
+        ...(Number.isSafeInteger(record.receivedAt) ? { receivedAt: record.receivedAt } : {}) };
+    }
     return state;
   }
   if (message.type === 'options:tabs') {
@@ -607,7 +634,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       if (!isOptionsSender(sender, chrome.runtime.id, chrome.runtime.getURL('options.html'))) throw new Error('只允许扩展设置页修改配置');
       return options(message);
     }
-    if (!['bridge:poll', 'bridge:started', 'bridge:input-image', 'bridge:image', 'bridge:result', 'bridge:error', 'bridge:challenge-prepare', 'bridge:challenge-resume', 'bridge:challenge-retry', 'bridge:idle-prepare'].includes(message.type)) throw new Error('不允许的页面操作');
+    if (!['bridge:poll', 'bridge:started', 'bridge:input-image', 'bridge:image', 'bridge:result', 'bridge:error', 'bridge:challenge-prepare', 'bridge:challenge-resume', 'bridge:challenge-retry', 'bridge:idle-prepare', 'bridge:qwen-observation'].includes(message.type)) throw new Error('不允许的页面操作');
     return content(message, sender);
   })().then(data => respond({ ok: true, data }), error => respond({ ok: false, error: safeError(error) }));
   return true;

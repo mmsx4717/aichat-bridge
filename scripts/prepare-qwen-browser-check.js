@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const paths = { '/c/fixture-conversation': path.join(root, 'test/browser/qwen-completion.html') };
-for (const name of ['qwen-dom', 'dom', 'shared']) paths[`/extension/${name}.js`] = path.join(root, `extension/${name}.js`);
+for (const name of ['qwen-dom', 'dom', 'shared', 'background-observation']) paths[`/extension/${name}.js`] = path.join(root, `extension/${name}.js`);
 paths['/test-source.png'] = path.join(root, 'test/fixtures/image-equivalence/source.png');
 for (let index = 1; index <= 4; index++) paths[`/test/upload_bridge-audit-${index}.png`] = paths['/test-source.png'];
 const output = path.join(os.tmpdir(), 'aichat-qwen-browser-check.js');

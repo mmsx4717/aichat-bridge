@@ -1,4 +1,5 @@
 import { normalizeText, conversationUrl } from './shared.js';
+export { createObservationRecorder } from './background-observation.js';
 import {
   PageSafetyError, visible, composerText, markdownText as sharedMarkdown,
   validateInputImages, decodeImagePayload, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES,
@@ -327,6 +328,42 @@ export function finalCandidate(doc, baseline, previousUser) {
   let text = bodies.map(markdownText).filter(Boolean).join('\n\n');
   if (skippedImages) text += `${text ? '\n\n' : ''}（${skippedImages} 张外部来源配图未转发，请在 Qwen 网页查看。）`;
   return text || images.length ? { message, text, images, skippedImages } : null;
+}
+
+// This lease drives only the Qwen MAIN-world frame adapter. State replies are
+// untrusted metadata and can never authorize a prompt or a final answer.
+export function beginBackgroundRendering(doc, timeoutMs) {
+  const win = doc.defaultView, token = win.crypto.randomUUID();
+  let state = {}, stopped = false;
+  const send = action => doc.dispatchEvent(new win.CustomEvent('aichat:qwen:frame-control', { detail: { action, token, timeoutMs } }));
+  const receive = event => {
+    const data = event.detail;
+    if (data?.token !== token || !Number.isSafeInteger(data.pending) || data.pending < 0 || data.pending > 512 ||
+        !Number.isSafeInteger(data.resumed) || data.resumed < 0 || data.resumed > 3600000) return;
+    state = { framePending: data.pending, frameResumed: data.resumed };
+  };
+  doc.addEventListener('aichat:qwen:frame-state', receive);
+  send('start');
+  return {
+    wake() { if (!stopped) send('pulse'); },
+    stats() { return { ...state }; },
+    stop() { if (stopped) return; stopped = true; doc.removeEventListener('aichat:qwen:frame-state', receive); send('stop'); },
+  };
+}
+
+// Diagnostic only: these counters never authorize completion or submission.
+export function backgroundObservation(doc, baseline, user) {
+  const current = baseline?.submissionUser?.node || user;
+  const row = current?.isConnected ? rowOf(current) : null;
+  const matches = row ? [...row.querySelectorAll(ASSISTANT)].filter(message => !baseline.assistants.has(key(message))) : [];
+  const message = matches.length === 1 ? matches[0] : null;
+  const bodies = message ? [...message.querySelectorAll(BODY)] : [];
+  return {
+    hidden: doc.visibilityState !== 'visible', focused: doc.hasFocus(), generating: generating(doc),
+    complete: Boolean(message && completed(message)),
+    bodyChars: Math.min(3600000, bodies.reduce((sum, body) => sum + body.textContent.length, 0)),
+    bodyCount: Math.min(3600000, bodies.length), footerCount: Math.min(3600000, message?.querySelectorAll(FOOTER).length || 0),
+  };
 }
 
 export async function readAnswerImage(image, { fetchImpl = globalThis.fetch, timeoutMs = 15000 } = {}) {

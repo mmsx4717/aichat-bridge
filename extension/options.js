@@ -1,3 +1,4 @@
+import { observationLines } from './background-observation.js';
 const $ = id => document.getElementById(id);
 const PLATFORMS = {
   qq: { name: 'QQ', title: 'QQ 官方机器人', description: '使用 QQ 开放平台的 AppID / AppSecret', groupId: 'group_openid', appPlaceholder: '输入纯数字 AppID' },
@@ -238,7 +239,17 @@ async function refresh() {
       }
       return entry;
     }));
-    hasNotices = Boolean(status.localNotices?.length);
+    const observation = status.backgroundObservation;
+    const lines = observationLines(observation?.samples);
+    if (lines.length) {
+      const entry = el('div', undefined, 'notice');
+      entry.append(el('strong', `Qwen 后台观察 · 标签页 ${observation.tabId}`), el('time', new Date(observation.at).toLocaleString('zh-CN')),
+        el('small', '仅保留最近任务的状态数字，不含正文。可在保持 Qwen 隐藏时查看；记录不代表问题已修复。', 'hint'));
+      entry.append(el('p', observation.receivedAt ? `扩展收到最终答案：${new Date(observation.receivedAt).toLocaleString('zh-CN')}（群内送达结果见任务记录）` : '此记录尚未确认最终答案到达扩展。', 'hint'));
+      for (const line of lines) entry.append(el('p', line, 'hint'));
+      $('notices').append(entry);
+    }
+    hasNotices = Boolean(status.localNotices?.length || lines.length);
     hasHistory = status.clearableHistoryCount > 0;
     if (!hasNotices) $('notices').append(el('p', '暂无历史故障提示。', 'empty'));
     if (status.moderation) $('words-summary').textContent = status.moderation.valid ? `${name} 已保存 ${status.moderation.count} 条词语；助手开启后用于新消息与未启动任务。` : '词表无效，提问已暂停；请修复并保存。';

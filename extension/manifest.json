@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AIChat桥接",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "minimum_chrome_version": "120",
   "description": "ChatGPT、Claude、Gemini 与海外版 Qwen 网页独立连接 QQ 和飞书机器人，支持双通道、图片、富文本回复与关键词拦截。",
   "permissions": [
@@ -43,6 +43,17 @@
       ],
       "run_at": "document_idle",
       "all_frames": false
+    },
+    {
+      "matches": [
+        "https://chat.qwen.ai/*"
+      ],
+      "js": [
+        "qwen-frame-scheduler.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
     }
   ],
   "web_accessible_resources": [
@@ -53,7 +64,8 @@
         "claude-dom.js",
         "gemini-dom.js",
         "image-equivalence.js",
-        "qwen-dom.js"
+        "qwen-dom.js",
+        "background-observation.js"
       ],
       "matches": [
         "https://chatgpt.com/*",

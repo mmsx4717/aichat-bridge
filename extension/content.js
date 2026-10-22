@@ -1,7 +1,7 @@
 (() => {
   if (globalThis.__chatGPTBotBridge) return;
   globalThis.__chatGPTBotBridge = true;
-  const CONTENT_VERSION = '0.1.6';
+  const CONTENT_VERSION = '0.1.7';
   const pageOpenedAt = Date.now();
   let bridgeIdleSince = pageOpenedAt;
   const IDLE_REFRESH_MS = 10 * 60 * 1000;
@@ -12,6 +12,7 @@
   const sessionId = crypto.randomUUID();
   let running = false; let wakePending = false; let platformLabel = '机器人';
   let reloading = false; let recoveryChecked = false;
+  let lastWorkerWakeAt = Date.now();
   // Worker messages and browser lifecycle events can arrive while page timers
   // are throttled. Wake only existing waits; never start another submission.
   const activeWaits = new Set();
@@ -60,7 +61,7 @@
       : assistant === 'claude'
         ? await import(chrome.runtime.getURL('claude-dom.js'))
         : await import(chrome.runtime.getURL('dom.js'));
-    function confirmedUser({ baseline, prompt, check, deadline }) {
+    function confirmedUser({ baseline, prompt, check, deadline, observe }) {
       return new Promise((resolve, reject) => {
         const confirmDeadline = Math.min(deadline, Date.now() + 20000);
         let finished = false; let timer; let waitingForRender = false;
@@ -86,6 +87,7 @@
             check();
             if (Date.now() >= deadline) throw new Error(`等待 ${assistantLabel} 回复超时；不会重新提问`);
             const user = dom.findSubmittedUser(document, baseline, prompt);
+            observe?.(null, user);
             if (user) { finish(null, user); return; }
             // Provider-verified pending state may outlast the missing-message
             // window: Gemini has an exact prompt in its temporary shell;
@@ -115,7 +117,7 @@
         changed();
       });
     }
-    function completedAnswer({ baseline, user, check, deadline, fingerprint }) {
+    function completedAnswer({ baseline, user, check, deadline, fingerprint, observe }) {
       return new Promise((resolve, reject) => {
         let finished = false; let timer; let previous = ''; let stableSince = 0; let firstCandidateAt = null;
         let background = document.visibilityState !== 'visible';
@@ -141,6 +143,7 @@
             // quiet DOM or an unchanged string alone never proves completion.
             const candidate = dom.finalCandidate(document, baseline, user);
             const now = Date.now();
+            observe?.(candidate);
             if (now >= deadline) throw new Error('没有识别到明确完成的最终回复；已停止转发');
             const current = fingerprint(candidate);
             if (candidate && firstCandidateAt === null) firstCandidateAt = now;
@@ -222,6 +225,37 @@
       let input = null; let baseline = null; let user = null; let inputPreparationMs = 0;
       const bridgeIdleMs = Math.min(2592000000, Math.max(0, job.idleRefresh?.idleMs ?? job.recoveryBridgeIdleMs ?? Date.now() - bridgeIdleSince));
       let phase = 'prepare';
+      let backgroundRendering = null;
+      const recorder = assistant === 'qwen' ? dom.createObservationRecorder?.(Date.now()) : null;
+      let observationPending = null, observationSending = false, latestObservation;
+      let lastObservationCheck = -Infinity, lastObservationHidden, lastObservationCandidate, lastObservationFocused, lastObservationPhase;
+      const sendObservation = async () => {
+        if (observationSending) return;
+        observationSending = true;
+        try {
+          while (observationPending) {
+            const samples = observationPending; observationPending = null;
+            await rpc('bridge:qwen-observation', { jobId: job.id, conversationUrl: url, samples });
+          }
+        } catch { /* Diagnostic delivery must never stop or retry an AI task. */ }
+        finally { observationSending = false; }
+      };
+      const observe = recorder ? (candidate, currentUser = user) => {
+        try {
+          const now = Date.now();
+          const hidden = document.visibilityState !== 'visible', focused = document.hasFocus();
+          if (now - lastObservationCheck < 1000 && hidden === lastObservationHidden && Boolean(candidate) === lastObservationCandidate && focused === lastObservationFocused && phase === lastObservationPhase) return;
+          lastObservationCheck = now; lastObservationHidden = hidden; lastObservationCandidate = Boolean(candidate); lastObservationFocused = focused; lastObservationPhase = phase;
+          const samples = recorder.capture(now, { ...dom.backgroundObservation(document, baseline, currentUser), candidate: Boolean(candidate), phase, ...backgroundRendering?.stats(),
+            wakeAgeMs: Math.min(3600000, Math.max(0, now - lastWorkerWakeAt)) });
+          if (samples) {
+            latestObservation = samples;
+            // The final samples ride with the result, avoiding a diagnostic RPC
+            // queued in front of delivery and proving when the worker receives it.
+            if (phase !== 'delivery') { observationPending = samples; void sendObservation(); }
+          }
+        } catch { /* DOM diagnostics are optional and cannot alter completion. */ }
+      } : undefined;
       const diagnostics = () => ({ pageAgeMs: Math.min(2592000000, Math.max(0, Date.now() - pageOpenedAt)), bridgeIdleMs,
         visibility: document.visibilityState === 'visible' ? 'visible' : 'hidden', phase });
       const guard = event => {
@@ -284,6 +318,11 @@
           }
           status('正在确认本次任务');
           await rpc('bridge:started', { jobId: job.id, conversationUrl: url });
+          if (assistant === 'qwen' && dom.beginBackgroundRendering) {
+            backgroundRendering = dom.beginBackgroundRendering(document, Math.max(1, deadline - Date.now()));
+            activeWaits.add(backgroundRendering.wake);
+          }
+          observe?.(null);
           const inputPreparationStartedAt = Date.now();
           check(); dom.assertReady(document);
           if (dom.newUsers(document, baseline).length) throw new Error('确认期间出现了新消息，已停止发送');
@@ -360,11 +399,11 @@
           phase = 'submit';
           button.click(); // Exactly one click. Never retry submission.
           status('已发送，等待本次完整回复');
-          user = await confirmedUser({ baseline, prompt: job.prompt, check, deadline });
+          user = await confirmedUser({ baseline, prompt: job.prompt, check, deadline, observe });
         }
         const fingerprint = candidate => candidate ? JSON.stringify({ text: candidate.text, images: candidate.images || [] }) : '';
         phase = job.recovery ? 'challenge-recovery' : 'answer';
-        const { finalAnswer, confirmationMs, background } = await completedAnswer({ baseline, user, check, deadline, fingerprint });
+        const { finalAnswer, confirmationMs, background } = await completedAnswer({ baseline, user, check, deadline, fingerprint, observe });
         if (finalAnswer.text.length > 120000) throw new Error('最终回复超过 120000 字符，已停止回传；请在网页查看');
         check();
         // One last DOM check prevents a late stream update or manual new turn from slipping through.
@@ -401,7 +440,8 @@
         assertFinal();
         const timing = { confirmationMs, inputPreparationMs, imagePreparationMs: Date.now() - preparationStartedAt, background };
         phase = 'delivery';
-        const result = await rpc('bridge:result', { jobId: job.id, conversationUrl: url, text: finalAnswer.text, images, timing });
+        observe?.(finalAnswer);
+        const result = await rpc('bridge:result', { jobId: job.id, conversationUrl: url, text: finalAnswer.text, images, timing, ...(latestObservation ? { observation: latestObservation } : {}) });
         if (result.failed) throw new Error(result.error || '最终回复未回传');
         status(result.pending ? '回复已暂存，将在有效回复时间内重试' : '本次回复已交给' + platformLabel + '扩展处理');
       } catch (error) {
@@ -423,6 +463,7 @@
           ...(assistant === 'chatgpt' ? { diagnostics: diagnostics() } : {}) }).catch(() => {});
         // Preserve any draft on failure. Never clear text that a human may have touched.
       } finally {
+        if (backgroundRendering) { activeWaits.delete(backgroundRendering.wake); backgroundRendering.stop(); }
         bridgeIdleSince = Date.now();
         if (input) dom.releaseInputImages?.(input);
         ['beforeinput', 'input', 'keydown', 'paste', 'pointerdown'].forEach(name => document.removeEventListener(name, guard, true));
@@ -470,6 +511,7 @@
     chrome.runtime.onMessage.addListener((message, sender) => {
       if (message?.type !== 'bridge:wake' || !chrome.runtime.id || sender?.id !== chrome.runtime.id || sender.tab !== undefined) return;
       if (sender.url !== undefined && sender.url !== chrome.runtime.getURL('worker.js')) return;
+      lastWorkerWakeAt = Date.now();
       wakeWaits(); void poll(true);
     });
     const wakePage = () => { wakeWaits(); void poll(true); };

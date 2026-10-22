@@ -107,6 +107,49 @@ test('missing heartbeat ACK reconnects; invalid session resets to Identify', asy
   assert.equal(ws3.sent[0].op, 2); h.adapter.stop();
 });
 
+test('socket failure revokes readiness and timers before a delayed native close', async () => {
+  const h = harness(); const ws = await h.start(1000);
+  let closeCalls = 0;
+  ws.close = () => { closeCalls++; ws.readyState = 2; };
+  ws.emit('error'); await flush();
+  await assert.rejects(h.adapter.reply({ chatId: 'group_1', messageId: 'original', text: 'hello', msgSeq: 1 }), error => error.code === 'not_ready');
+  assert.equal(h.calls.filter(call => call.url.endsWith('/messages')).length, 0);
+  assert.equal(h.states.at(-1).state, 'reconnecting');
+  await h.tick(1000);
+  assert.equal(closeCalls, 1); assert.equal(h.sockets.length, 2);
+  const next = h.sockets.at(-1); next.open(); next.message({ op: 10, d: { heartbeat_interval: 45000 } });
+  next.message({ op: 0, s: 1, t: 'RESUMED', d: {} }); await flush();
+  ws.emit('error'); ws.emit('close', { code: 1006 }); await h.tick(1000);
+  assert.equal(closeCalls, 1); assert.equal(h.sockets.length, 2);
+  assert.equal(h.states.at(-1).state, 'connected'); h.adapter.stop();
+});
+
+test('fatal close arriving after an error cancels the pending reconnect', async () => {
+  for (const delayed of [false, true]) {
+    const h = harness(); const task = h.adapter.start(); const rejected = assert.rejects(task, /长连接建立失败/); await flush();
+    const ws = h.sockets[0]; ws.close = () => { ws.readyState = 2; };
+    ws.emit('error'); if (delayed) await rejected;
+    ws.readyState = 3; ws.emit('close', { code: 4004 }); await rejected;
+    await h.tick(65000);
+    assert.equal(h.sockets.length, 1); assert.equal(h.states.at(-1).state, 'error');
+    h.adapter.stop(); await h.start(); assert.equal(h.states.at(-1).state, 'connected'); h.adapter.stop();
+  }
+});
+
+test('failed handshake leaves no stale timeout or control frames on its replacement', async () => {
+  const h = harness({ timeout: 5000 }); const task = h.adapter.start();
+  const rejected = assert.rejects(task, /长连接建立失败/); await flush();
+  const ws = h.sockets[0]; let closes = 0; ws.close = () => { closes++; ws.readyState = 2; };
+  ws.emit('error'); await rejected;
+  ws.message({ op: 9, d: false }); ws.message({ op: 10, d: { heartbeat_interval: 1000 } });
+  await h.tick(1000);
+  const next = h.sockets.at(-1); next.open(); next.message({ op: 10, d: { heartbeat_interval: 45000 } });
+  next.message({ op: 0, s: 1, t: 'READY', d: { session_id: 'replacement' } }); await flush();
+  await h.tick(6000);
+  assert.equal(closes, 1); assert.equal(h.sockets.length, 2);
+  assert.equal(h.states.at(-1).state, 'connected'); h.adapter.stop();
+});
+
 test('fatal permissions do not enter an automatic reconnect loop', async () => {
   for (const code of [4001, 4002, 4012, 4014, 4914, 4915]) {
     const h = harness(); const ws = await h.start(); ws.close(code); await h.tick(65000);

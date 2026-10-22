@@ -1697,3 +1697,82 @@ test('transient protection reads preserve restoration records without blocking c
     assert.equal(x.tab.autoDiscardable, true, operation);
   }
 });
+
+const observationSample = { elapsedMs: 1000, gapMs: 1000, wakeAgeMs: 0, bodyChars: 10, bodyCount: 1, footerCount: 1,
+  hidden: true, generating: false, complete: true, candidate: true };
+for (const platform of ['qq', 'feishu']) {
+  test(`Qwen ${platform} observations remain local, bounded and clear independently of jobs and other channels`, async () => {
+    const x = await setup({ assistant: 'qwen', platform });
+    await x.send({ type: 'bridge:poll' }); await x.send({ type: 'bridge:started', jobId: 'job-1' });
+    const savedJob = structuredClone(x.store['bot.bridge.job.7']); const before = x.calls.length;
+    const samples = [{ ...observationSample, text: 'private answer', secret: 'private credential' }];
+    assert.equal((await x.send({ type: 'bridge:qwen-observation', jobId: 'job-1', samples })).ok, true);
+    assert.equal(x.calls.length, before, 'observations must not reach bot APIs');
+    assert.deepEqual(x.store['bot.bridge.job.7'], savedJob, 'no deadline or state changes');
+    const key = 'bot.bridge.observation.qwen.' + platform;
+    assert.deepEqual(x.store[key].samples, [observationSample]);
+    assert.equal(x.tabUpdates.some(update => update.properties.active), false);
+    const state = await x.send({ type: 'options:status', assistant: 'qwen', platform }, x.optionsSender);
+    assert.deepEqual(state.data.backgroundObservation.samples, [observationSample]);
+    const otherKey = 'bot.bridge.observation.qwen.' + (platform === 'qq' ? 'feishu' : 'qq');
+    x.store[otherKey] = { samples: [observationSample] };
+    assert.equal((await x.send({ type: 'options:clear-notices', assistant: 'qwen', platform }, x.optionsSender)).ok, true);
+    assert.equal(x.store[key], undefined); assert.ok(x.store[otherKey]);
+    assert.deepEqual(x.store['bot.bridge.job.7'], savedJob);
+  });
+}
+
+test('Qwen observation rejects stale, unstarted, expired or malformed task reports', async () => {
+  const x = await setup({ assistant: 'qwen' });
+  const message = { type: 'bridge:qwen-observation', jobId: 'job-1', samples: [observationSample] };
+  await x.send({ type: 'bridge:poll' });
+  assert.equal((await x.send(message)).ok, false);
+  await x.send({ type: 'bridge:started', jobId: 'job-1' });
+  for (const changes of [{ jobId: 'other' }, { sessionId: 'another_session_12345' },
+    { conversationUrl: 'https://chat.qwen.ai/c/other' }, { samples: [] }, { samples: [{ ...observationSample, bodyChars: 'answer' }] }]) {
+    assert.equal((await x.send({ ...message, ...changes })).ok, false);
+  }
+  x.store['bot.bridge.job.7'].expiresAt = Date.now() - 1;
+  assert.equal((await x.send(message)).ok, false);
+  assert.equal(x.store['bot.bridge.observation.qwen.qq'], undefined);
+});
+
+test('other assistant tasks cannot write Qwen observations', async () => {
+  const x = await setup();
+  await x.send({ type: 'bridge:poll' }); await x.send({ type: 'bridge:started', jobId: 'job-1' });
+  assert.equal((await x.send({ type: 'bridge:qwen-observation', jobId: 'job-1', samples: [observationSample] })).ok, false);
+  assert.equal(x.store['bot.bridge.observation.qwen.qq'], undefined);
+});
+
+for (const badDiagnostics of [false, true]) {
+  test(`Qwen result records worker receipt separately from readiness; malformed metadata=${badDiagnostics}`, async () => {
+    const x = await setup({ assistant: 'qwen' });
+    await x.send({ type: 'bridge:poll' }); await x.send({ type: 'bridge:started', jobId: 'job-1' });
+    const observation = [{ ...observationSample, focused: false, phase: 'delivery', text: 'PRIVATE DIAGNOSTIC' }];
+    const result = await x.send({ type: 'bridge:result', jobId: 'job-1', text: 'Final answer', images: [], observation: badDiagnostics ? 'invalid' : observation });
+    assert.equal(result.ok, true); assert.equal(x.store['bot.bridge.job.7'], undefined);
+    const record = x.store['bot.bridge.observation.qwen.qq'];
+    if (badDiagnostics) assert.equal(record, undefined);
+    else {
+      assert.ok(Number.isSafeInteger(record.receivedAt)); assert.equal(record.samples.at(-1).phase, 'delivery');
+      assert.doesNotMatch(JSON.stringify(record), /PRIVATE DIAGNOSTIC|Final answer/);
+      const status = await x.send({ type: 'options:status', assistant: 'qwen', platform: 'qq' }, x.optionsSender);
+      assert.equal(status.data.backgroundObservation.receivedAt, record.receivedAt);
+    }
+    const delivery = x.calls.find(call => call.path.endsWith('/result'));
+    assert.equal(delivery.body.text, 'Final answer'); assert.equal(delivery.body.observation, undefined);
+  });
+}
+
+test('Qwen diagnostic storage failure cannot reject an otherwise valid final answer', async () => {
+  const x = await setup({ assistant: 'qwen' });
+  await x.send({ type: 'bridge:poll' }); await x.send({ type: 'bridge:started', jobId: 'job-1' });
+  const originalSet = x.chrome.storage.local.set;
+  x.chrome.storage.local.set = async values => {
+    if (Object.keys(values).some(key => key.startsWith('bot.bridge.observation.'))) throw new Error('Diagnostic storage failure');
+    return originalSet(values);
+  };
+  const result = await x.send({ type: 'bridge:result', jobId: 'job-1', text: 'Final answer', images: [], observation: [observationSample] });
+  assert.equal(result.ok, true); assert.equal(result.data.pending, undefined);
+  assert.equal(x.calls.filter(call => call.path.endsWith('/result')).length, 1);
+});

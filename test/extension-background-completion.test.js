@@ -7,6 +7,7 @@ import * as qwen from '../extension/qwen-dom.js';
 import * as shared from '../extension/shared.js';
 import { composerHTML, user as qwenUser, answer as qwenAnswer } from './helpers/qwen-fixture.js';
 
+const frameSource = await readFile(new URL('../extension/qwen-frame-scheduler.js', import.meta.url), 'utf8');
 const geminiHTML = await readFile(new URL('./fixtures/gemini-conversation.html', import.meta.url), 'utf8');
 const source = (await readFile(new URL('../extension/content.js', import.meta.url), 'utf8'))
   .replace("await import(chrome.runtime.getURL('gemini-dom.js'))", 'globalThis.__adapter')
@@ -17,7 +18,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 // Use each real adapter (including its completion gates), not ChatGPT's DOM
 // with a different job label. Worker notifications advance waits while every
 // page timer is deliberately held; no visibility/focus event is dispatched.
-async function fixture(provider, change = () => {}) {
+async function fixture(provider, change = () => {}, failObservation = false) {
   const adapter = provider === 'qwen' ? qwen : gemini;
   const url = provider === 'qwen' ? 'https://chat.qwen.ai/c/fixture-conversation' : 'https://gemini.google.com/app/1111111111111111';
   const html = provider === 'qwen' ? `<main><div id="chat-message-container"></div>${composerHTML}</main>` : geminiHTML;
@@ -28,6 +29,7 @@ async function fixture(provider, change = () => {}) {
   Object.defineProperty(doc, 'visibilityState', { value: 'hidden' });
   Object.defineProperty(doc, 'hidden', { value: true });
   win.Date = class extends Date { static now() { return now; } };
+  win.performance.now = () => now;
   win.setTimeout = win.setInterval = fn => { const id = ++nextTimer; timers.set(id, fn); return id; };
   win.clearTimeout = win.clearInterval = id => timers.delete(id);
   doc.execCommand = (command, _ui, text) => {
@@ -35,6 +37,14 @@ async function fixture(provider, change = () => {}) {
     input.dispatchEvent(new win.InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
     return true;
   };
+  if (provider === 'qwen') {
+    // JSDOM does not suspend native rAF when visibility is overridden. Model
+    // the same paused frame queue as paused timers, independently of CPU load.
+    const frames = new Map(); let frameId = 0;
+    win.requestAnimationFrame = callback => { frames.set(++frameId, callback); return frameId; };
+    win.cancelAnimationFrame = id => frames.delete(id);
+    win.eval(frameSource);
+  }
   win.__adapter = adapter; win.__shared = shared;
   const template = provider === 'gemini' ? doc.querySelector('.conversation-container').cloneNode(true) : null;
   send.addEventListener('click', () => {
@@ -63,6 +73,7 @@ async function fixture(provider, change = () => {}) {
     onMessage: { addListener(listener) { listeners.push(listener); } },
     async sendMessage(message) {
       messages.push(message);
+      if (failObservation && message.type === 'bridge:qwen-observation') throw new Error('Diagnostic storage unavailable');
       let data = {};
       if (message.type === 'bridge:poll') {
         data = { job: leased ? null : { id: 'background-job', assistant: provider, platform: 'qq', conversationUrl: url, prompt: 'Background question', timeoutMs: 90000, images: [] } };
@@ -144,3 +155,61 @@ for (const provider of ['qwen', 'gemini']) {
     } finally { x.close(); }
   });
 }
+
+for (const failObservation of [false, true]) {
+  test(`Qwen passive diagnostics do not affect single background completion, diagnostic failure=${failObservation}`, async () => {
+    const x = await fixture('qwen', () => {}, failObservation);
+    try {
+      for (let i = 0; i < 6; i++) await x.pulse();
+      const reports = x.messages.filter(message => message.type === 'bridge:qwen-observation');
+      assert.ok(reports.length > 0);
+      for (const report of reports) {
+        assert.ok(report.samples.every(sample => sample.hidden && Object.entries(sample).every(([key, value]) => key === 'phase' ? ['prepare', 'submit', 'answer', 'delivery'].includes(value) : ['boolean', 'number'].includes(typeof value))));
+        assert.doesNotMatch(JSON.stringify(report.samples), /Background answer|Background question/);
+      }
+      assert.equal(x.result?.text, 'Background answer'); assert.equal(x.error, undefined);
+      assert.equal(x.result.observation.at(-1).phase, 'delivery');
+      assert.equal(x.result.observation[0].phase, 'prepare');
+      assert.equal(x.clicks, 1); assert.equal(x.actionClicks, 0); assert.equal(x.doc.visibilityState, 'hidden');
+      assert.equal(x.messages.filter(message => message.type === 'bridge:result').length, 1);
+    } finally { x.close(); }
+  });
+}
+
+test('Qwen records a completed answer while prompt rendering still delays ownership confirmation', async () => {
+  const x = await fixture('qwen', ({ doc }) => {
+    doc.querySelector('.user-message-content').textContent = 'Back';
+  });
+  try {
+    await x.pulse(); await x.pulse();
+    for (let i = 0; i < 6; i++) await x.pulse(5000);
+    assert.equal(x.result, undefined); assert.equal(x.error, undefined);
+    const latest = x.messages.filter(message => message.type === 'bridge:qwen-observation').at(-1).samples.at(-1);
+    assert.equal(latest.phase, 'submit'); assert.equal(latest.hidden, true);
+    assert.equal(latest.bodyChars, 'Background answer'.length);
+    assert.equal(latest.complete, true); assert.equal(latest.candidate, false);
+    x.doc.querySelector('.user-message-content').textContent = 'Background question';
+    await flush(); await x.pulse(); await x.pulse();
+    assert.equal(x.result?.text, 'Background answer'); assert.equal(x.clicks, 1);
+    assert.ok(x.result.observation.some(s => s.phase === 'submit'));
+    assert.equal(x.result.observation.at(-1).phase, 'delivery');
+  } finally { x.close(); }
+});
+
+test('Qwen background frame assistance renders the prompt and footer before normal ownership/completion checks', async () => {
+  const x = await fixture('qwen', ({ doc, answer }) => {
+    const prompt = doc.querySelector('.user-message-content');
+    const expected = prompt.textContent; prompt.textContent = '';
+    const footer = answer.querySelector('.response-message-footer'); footer.remove();
+    doc.defaultView.requestAnimationFrame(() => { prompt.textContent = expected; answer.append(footer); });
+  });
+  try {
+    for (let i = 0; i < 7; i++) await x.pulse();
+    assert.equal(x.result?.text, 'Background answer'); assert.equal(x.error, undefined);
+    assert.equal(x.doc.visibilityState, 'hidden'); assert.equal(x.clicks, 1); assert.equal(x.actionClicks, 0);
+    assert.ok(x.result.observation.at(-1).frameResumed >= 1);
+    let after = 0; x.doc.defaultView.requestAnimationFrame(() => after++);
+    for (let i = 0; i < 3; i++) await x.pulse();
+    assert.equal(after, 0, 'frame assistance ends with the job');
+  } finally { x.close(); }
+});
