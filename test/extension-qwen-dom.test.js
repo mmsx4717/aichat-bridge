@@ -7,6 +7,24 @@ function state(doc,body) { const baseline=dom.snapshot(doc);user(doc);const subm
 const candidate=(doc,s)=>dom.finalCandidate(doc,s.baseline,s.submitted);
 function upload(doc,name='bridge-1.png',source) { const input=dom.composer(doc);dom.attachInputImage(doc,input,payload,name);return attachment(doc,name,source); }
 
+for (const initialType of [null, 'file']) test('Qwen initializes native attachment routing before file change: '+initialType, () => {
+  const { window: w } = page(), d = w.document, input = dom.composer(d);
+  let changes = 0;
+  const h = fileHarness(w, files => { changes++; attachment(d, files[0].name); h.files = []; }, { requireUploadType: true });
+  if (initialType) h.field.dataset.type = initialType;
+  let pickerClicks = 0; h.field.addEventListener('click', () => pickerClicks++);
+  try {
+    const names = [];
+    for (let n = 1; n <= 4; n++) {
+      const name = `bridge-fresh-${n}.png`;
+      dom.attachInputImage(d, input, payload, name); names.push(name);
+      assert.equal(dom.inputAttachmentState(input, names).ready, true);
+      h.field.removeAttribute('data-type'); // The next render may recreate uninitialized upload controls.
+    }
+    assert.equal(changes, 4); assert.equal(pickerClicks, 0);
+  } finally { w.close(); }
+});
+
 test('Qwen reads completed background answers without page focus or painted action controls', () => {
   const { window: w } = page(), d = w.document;
   Object.defineProperties(d, { hidden: { value: true, configurable: true }, visibilityState: { value: 'hidden', configurable: true } });

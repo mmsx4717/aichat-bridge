@@ -13,7 +13,7 @@ async function fixture({imageCount=0,remount=false,uploadMissing=false,mutation,
   let now=1000,serial=0,clicks=0,released=0;const schedule=(fn,ms,repeat=0)=>{const id=++serial;timers.set(id,{fn,at:now+ms,repeat});return id;};
   w.Date=class extends Date{static now(){return now;}};w.setTimeout=(fn,ms)=>schedule(fn,ms);w.clearTimeout=id=>timers.delete(id);w.setInterval=(fn,ms)=>schedule(fn,ms,ms);w.clearInterval=id=>timers.delete(id);
   w.__shared=shared;w.__qwen={...qwen,releaseInputImages(input){released++;qwen.releaseInputImages(input);},readAnswerImage:image=>qwen.readAnswerImage(image,{fetchImpl:async()=>new Response(png,{headers:{'content-type':'image/png'}})})};
-  const h=fileHarness(w,files=>{const f=files[0];uploads.push(f.name);h.files=[];if(!uploadMissing)attachment(d,f.name);if(remount){const i=qwen.composer(d),next=i.cloneNode(true);i.replaceWith(next);if(mutation==='remount-draft')next.value='Human draft';}});
+  const h=fileHarness(w,files=>{const f=files[0];uploads.push(f.name);h.files=[];if(!uploadMissing)attachment(d,f.name);if(remount){const i=qwen.composer(d),next=i.cloneNode(true);i.replaceWith(next);if(mutation==='remount-draft')next.value='Human draft';}}, {requireUploadType:true});
   d.addEventListener('input',()=>{
     if(mutation==='draft')schedule(()=>{qwen.composer(d).value='Human draft';},200);
     if(mutation==='navigation')schedule(()=>w.history.replaceState({},'', '/c/other-conversation'),200);

@@ -1,7 +1,7 @@
 (() => {
   if (globalThis.__chatGPTBotBridge) return;
   globalThis.__chatGPTBotBridge = true;
-  const CONTENT_VERSION = '0.1.7';
+  const CONTENT_VERSION = '0.1.8';
   const pageOpenedAt = Date.now();
   let bridgeIdleSince = pageOpenedAt;
   const IDLE_REFRESH_MS = 10 * 60 * 1000;
@@ -276,6 +276,25 @@
         if (!submissionClicked && input && dom.refreshComposer) input = dom.refreshComposer(document, input);
         if (!submissionClicked && input && !input.isConnected) throw new Error('网页输入框被替换或页面已退出登录');
       };
+      const clearDraft = async (afterFailure = false) => {
+        const clicked = new WeakSet(); const cleanupDeadline = Date.now() + 5000;
+        const empty = () => !normalizeText(dom.composerText(input)) && !dom.hasAttachments(input);
+        if (empty()) return;
+        do {
+          // Permission to discard existing drafts applies at task start. An
+          // active human edit or navigation still ends this run immediately.
+          if (human || conversationUrl(location.href, assistant) !== url || !input.isConnected || dom.composer(document) !== input) throw new Error('输入区已变化，未继续清理');
+          if (!afterFailure) check();
+          ownEditing = true;
+          try { dom.clearDraft(document, input, clicked); } finally { ownEditing = false; }
+          // Let controlled editors and native attachment removal commit before
+          // preparing another prompt. Never hide leftovers by deleting DOM.
+          await sleep(100);
+          if (human || conversationUrl(location.href, assistant) !== url || !input.isConnected || dom.composer(document) !== input) throw new Error('输入区已变化，未继续清理');
+          if (empty()) return;
+        } while (Date.now() < cleanupDeadline);
+        throw new Error('输入区仍有未清理的附件或草稿，请检查网页');
+      };
       ['beforeinput', 'input', 'keydown', 'paste', 'pointerdown'].forEach(name => document.addEventListener(name, guard, true));
       try {
         // Legacy jobs without a provider remain ChatGPT-only. Other work must
@@ -294,7 +313,7 @@
             while (Date.now() < readyDeadline) {
               check();
               try {
-                dom.assertReady(document);
+                dom.assertReady(document, { allowDraft: true });
                 restored = dom.snapshot(document).lastUserKey === job.idleRefresh.lastUserKey;
                 if (restored) break;
               } catch (error) {
@@ -305,9 +324,10 @@
             }
             if (!restored) throw new Error('发送前刷新后，原对话或输入区尚未恢复；未提交提问，请检查网页');
           }
-          check(); input = dom.assertReady(document); baseline = dom.snapshot(document);
+          check(); input = dom.assertReady(document, { allowDraft: true }); baseline = dom.snapshot(document);
           if (assistant === 'chatgpt' && !job.idleRefresh && bridgeIdleMs >= IDLE_REFRESH_MS) {
             phase = 'idle-refresh';
+            await clearDraft();
             status('桥接长时间闲置，发送前刷新原网页一次');
             await rpc('bridge:idle-prepare', { jobId: job.id, conversationUrl: url, lastUserKey: baseline.lastUserKey, diagnostics: diagnostics() });
             check(); dom.assertReady(document);
@@ -324,6 +344,9 @@
           }
           observe?.(null);
           const inputPreparationStartedAt = Date.now();
+          check();
+          status('正在清理输入区的草稿和附件');
+          await clearDraft();
           check(); dom.assertReady(document);
           if (dom.newUsers(document, baseline).length) throw new Error('确认期间出现了新消息，已停止发送');
           const attachmentNames = [];
@@ -458,10 +481,14 @@
             return;
           } catch (recoveryError) { reloading = false; error = recoveryError; }
         }
-        status(error.message || '本次任务已停止');
-        await rpc('bridge:error', { jobId: job.id, conversationUrl: url, error: String(error.message || '网页任务失败').slice(0, 240),
+        let message = error.message || '本次任务已停止';
+        if (input?.isConnected && !human && conversationUrl(location.href, assistant) === url) {
+          try { await clearDraft(true); }
+          catch (cleanupError) { message += '；' + (cleanupError.message || '输入区清理失败'); }
+        }
+        status(message);
+        await rpc('bridge:error', { jobId: job.id, conversationUrl: url, error: String(message).slice(0, 240),
           ...(assistant === 'chatgpt' ? { diagnostics: diagnostics() } : {}) }).catch(() => {});
-        // Preserve any draft on failure. Never clear text that a human may have touched.
       } finally {
         if (backgroundRendering) { activeWaits.delete(backgroundRendering.wake); backgroundRendering.stop(); }
         bridgeIdleSince = Date.now();
@@ -484,8 +511,9 @@
           recoveryChecked = true;
           if (recovery?.job) { handledJob = true; await run(recovery.job); return; }
         }
-        // Do not lease queued work while the user has a draft or another answer is generating.
-        dom.assertReady(document);
+        // Inspect readiness without mutating an idle page. Only a real leased
+        // task clears drafts; generating answers and page dialogs still block.
+        dom.assertReady(document, { allowDraft: true });
         ready = true;
         const response = await rpc('bridge:poll', { conversationUrl: url, capabilities: ['image-input-v1'] });
         if (!response.job) {
@@ -518,7 +546,8 @@
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') wakePage(); });
     // Restoring a frozen/BFCache document or focusing its window need not
     // produce a visibility change. Reuse the single-flight/readiness checks;
-    // these events never reload a page, clear a draft or repeat a submission.
+    // these events never reload or repeat a submission. A newly leased task
+    // follows the same explicit draft cleanup as an ordinary poll.
     window.addEventListener('pageshow', event => { if (event.persisted) wakePage(); });
     document.addEventListener('resume', wakePage);
     window.addEventListener('focus', wakePage);

@@ -42,6 +42,8 @@ async function fixture(assistant, { native = ['claude', 'qwen'].includes(assista
   win.__testAdapter = {
     MAX_TOTAL_IMAGE_BYTES: 30 * 1024 * 1024, validateInputImages,
     composer: () => input, composerText: editor => editor.textContent,
+    hasAttachments: () => false,
+    clearDraft: (_doc, editor) => { editor.textContent = ''; },
     composerInteraction: target => target === input, assertReady: () => input,
     snapshot: () => ({}), newUsers: () => [], generating: () => false,
     inputAttachmentState: (_input, names) => names.length ? state : { ready: true },

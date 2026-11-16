@@ -441,6 +441,24 @@ test('Gemini unnamed clipboard previews authorize only registered byte-identical
   assert.equal(dom.inputAttachmentState(upload.input, []).ready, false);
 });
 
+test('Gemini preview alt text is presentation; registered image bytes establish ownership', async () => {
+  for (const alt of ['', 'attachment', '附件', null]) {
+    const doc = page(); let reads = 0;
+    doc.defaultView.fetch = async () => { reads++; return new Response(png); };
+    const upload = clipboardUpload(doc); const image = upload.card.querySelector('img');
+    if (alt === null) image.removeAttribute('alt'); else image.alt = alt;
+    assert.deepEqual(dom.inputAttachmentState(upload.input, [upload.name]), { ready: false, reason: 'verifying' });
+    await settleClipboardRead();
+    assert.equal(dom.inputAttachmentState(upload.input, [upload.name]).ready, true);
+    image.alt = 'Updated accessibility label';
+    assert.equal(dom.inputAttachmentState(upload.input, [upload.name]).ready, true);
+    assert.equal(reads, 1, 'alt changes neither bypass nor repeat image verification');
+    dom.releaseInputImages(upload.input);
+    assert.equal(dom.inputAttachmentState(upload.input, [upload.name]).ready, false);
+    doc.defaultView.close();
+  }
+});
+
 test('Gemini hover-only close controls never prevent registered image verification or invalidate verified ownership', async () => {
   const changes = [
     card => { card.querySelector('button').style.visibility = 'hidden'; },
@@ -474,7 +492,7 @@ test('Gemini still requires a visible card and image with one known image struct
     card => { card.querySelector('img').style.visibility = 'hidden'; },
     card => { const duplicate = card.querySelector('img').cloneNode(true); duplicate.hidden = true; card.append(duplicate); },
     card => card.append(card.querySelector('img').cloneNode(true)),
-    card => { card.querySelector('img').alt = 'unknown'; },
+    card => card.append(card.querySelector('img')),
     card => card.querySelector('img').classList.remove('gem-attachment-style-img'),
   ]) {
     const doc = page(); let reads = 0; doc.defaultView.fetch = async () => { reads++; return new Response(png); };

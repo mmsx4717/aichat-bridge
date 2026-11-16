@@ -36,7 +36,7 @@ async function fixture({ source = productionSource, submittedText, pollGate, sta
   win.__testDom = { ...dom, assertReady(...args) { readinessChecks++; return dom.assertReady(...args); } };
   win.DataTransfer = class { constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; } };
   win.ClipboardEvent = class extends win.Event { constructor(type, options) { super(type, options); this.clipboardData = options.clipboardData; } };
-  doc.execCommand = (command, _ui, text) => { assert.equal(command, 'insertText'); input.textContent = text; return true; };
+  doc.execCommand = (command, _ui, text) => { assert.ok(['insertText', 'delete'].includes(command)); input.textContent = command === 'delete' ? '' : text; return true; };
   input.addEventListener('paste', event => {
     const file = event.clipboardData.files[0];
     doc.querySelector('[data-composer-attachments]').insertAdjacentHTML('beforeend', `<div data-testid="file-chip"><span>${file.name}</span><button aria-label="Remove attachment"></button></div>`);
@@ -232,33 +232,33 @@ test('a late timed-out poll reply is ignored and a later unstarted lease receipt
   } finally { x.close(); }
 });
 
-test('a draft blocks notification and visibility polling without an internal retry loop', async () => {
+test('idle notification and visibility polling leaves a draft intact without an internal retry loop', async () => {
   const x = await fixture();
   try {
     x.input.textContent = 'A human draft'; const checks = x.readinessChecks;
     x.wake(); await flush();
-    assert.equal(x.pollCount, 1); assert.equal(x.readinessChecks, checks + 1);
+    assert.equal(x.pollCount, 2); assert.equal(x.readinessChecks, checks + 1);
     await x.advance(4400); assert.equal(x.readinessChecks, checks + 1);
     await x.visibility('hidden'); await x.visibility('visible');
-    assert.equal(x.pollCount, 1); assert.equal(x.readinessChecks, checks + 2);
+    assert.equal(x.pollCount, 3); assert.equal(x.readinessChecks, checks + 2);
     for (const type of ['pageshow', 'resume', 'focus']) { x.lifecycle(type); await flush(); }
-    assert.equal(x.pollCount, 1); assert.equal(x.readinessChecks, checks + 5);
+    assert.equal(x.pollCount, 6); assert.equal(x.readinessChecks, checks + 5);
     assert.equal(dom.composerText(x.input), 'A human draft');
-    x.input.textContent = ''; x.wake(); await flush(); assert.equal(x.pollCount, 2);
+    x.input.textContent = ''; x.wake(); await flush(); assert.equal(x.pollCount, 7);
   } finally { x.close(); }
 });
 
-test('a queued wake cannot resubmit a failed old page turn or clear its preserved draft', async () => {
+test('a queued wake cannot resubmit a failed old page turn after clearing its draft', async () => {
   const x = await fixture({ submittedText: 'A different submitted question' });
   try {
     x.enqueue(); x.wake(); await flush();
     x.wake(trustedSender, undefined, 20);
-    await x.advance(700);
+    await x.advance(800);
     assert.equal(x.clicks, 1); assert.match(x.error.error, /新增网页消息与本次群消息不同/);
-    assert.equal(x.result, undefined); assert.equal(x.pollCount, 2);
-    assert.equal(dom.composerText(x.input), prompt);
+    assert.equal(x.result, undefined); assert.equal(x.pollCount, 3);
+    assert.equal(dom.composerText(x.input), '');
     await x.advance(4500);
-    assert.equal(x.clicks, 1); assert.equal(x.pollCount, 2);
+    assert.equal(x.clicks, 1); assert.equal(x.pollCount, 4);
     assert.equal(x.messages.filter(message => message.type === 'bridge:error').length, 1);
   } finally { x.close(); }
 });

@@ -27,11 +27,11 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
 const metadata = { id: '1'.repeat(64), mimeType: 'image/png', name: 'source.png', bytes: png.length };
 
-async function fixture(assistant, { remount, action, rpcDelays = {}, timeoutMs = 90000 } = {}) {
+async function fixture(assistant, { remount, action, rpcDelays = {}, timeoutMs = 90000, initialDraft = '', initialAttachment = false, failFirst = false, queuedJobs = 1 } = {}) {
   const page = new JSDOM(fixtures[assistant], { url: urls[assistant], runScripts: 'outside-only', pretendToBeVisual: true });
   const win = page.window; const doc = win.document; const dom = adapters[assistant]; const originalInput = dom.composer(doc);
   const messages = []; const timers = new Map(); const guards = new Map(); const listeners = [];
-  let now = 1000; let serial = 0; let clicks = 0; let currentInput = originalInput; let currentScope = dom.composerScope(originalInput); let remounts = 0; let rows = 0;
+  let now = 1000; let serial = 0; let clicks = 0; let currentInput = originalInput; let currentScope = dom.composerScope(originalInput); let remounts = 0; let rows = 0; let offered = 0; let removals = 0; let injected = false; let failedState;
   const schedule = (fn, ms, repeat = 0) => { const id = ++serial; timers.set(id, { fn, at: now + ms, repeat }); return id; };
   const add = doc.addEventListener.bind(doc); const remove = doc.removeEventListener.bind(doc);
   doc.addEventListener = (type, listener, options) => { if (options === true) guards.set(type, listener); add(type, listener, options); };
@@ -40,7 +40,16 @@ async function fixture(assistant, { remount, action, rpcDelays = {}, timeoutMs =
   win.setTimeout = (fn, ms) => schedule(fn, ms); win.clearTimeout = id => timers.delete(id);
   win.setInterval = (fn, ms) => schedule(fn, ms, ms); win.clearInterval = id => timers.delete(id);
   win.__testQwen = qwen; win.__testShared = shared; win.__testChatGPT = chatgpt; win.__testClaude = claude; win.__testGemini = gemini;
-  doc.execCommand = (command, _ui, text) => { assert.equal(command, 'insertText'); currentInput.textContent = text; return true; };
+  doc.execCommand = (command, _ui, text) => { assert.ok(['insertText', 'delete'].includes(command)); currentInput.textContent = command === 'delete' ? '' : text; return true; };
+  currentInput.textContent = initialDraft; if (assistant === 'qwen') currentInput.value = initialDraft;
+  const attachment = () => {
+    const card = doc.createElement(assistant === 'gemini' ? 'gem-media-attachment' : 'div'); card.dataset.cleanupAttachment = '';
+    if (assistant === 'qwen') { card.className = 'vision-item-container'; card.innerHTML = '<img alt="stale.png"><button class="close-button" style="visibility:hidden"></button>'; currentScope.querySelector('.file-card-list').append(card); }
+    else if (assistant === 'gemini') { card.innerHTML = '<img alt=""><gem-icon-button class="gem-attachment-close-button"><button aria-label="關閉附件"></button></gem-icon-button>'; currentScope.prepend(card); }
+    else { card.dataset.testid = 'attachment-preview'; card.innerHTML = '<img alt="stale.png"><button aria-label="Remove attachment"></button>'; currentScope.prepend(card); }
+    card.querySelector('button').addEventListener('click', () => { removals++; card.remove(); });
+  };
+  if (initialAttachment) attachment();
   const remountComposer = (draft = '') => {
     const replacement = currentScope.cloneNode(true); currentScope.replaceWith(replacement); currentScope = replacement;
     currentInput = dom.composer(doc); currentInput.textContent = draft; if (assistant === 'qwen') currentInput.value = draft; remounts++;
@@ -77,6 +86,7 @@ async function fixture(assistant, { remount, action, rpcDelays = {}, timeoutMs =
   };
   originalInput.addEventListener('input', () => {
     if (remount === 'before-send') schedule(() => remountComposer('Human replacement draft'), 200);
+    if (failFirst && !injected && dom.composerText(currentInput) === 'Question') { injected = true; attachment(); }
   });
   dom.sendButton(doc, originalInput).addEventListener('click', () => {
     clicks++; const question = dom.composerText(currentInput); currentInput.textContent = ''; if (assistant === 'qwen') currentInput.value = '';
@@ -99,7 +109,8 @@ async function fixture(assistant, { remount, action, rpcDelays = {}, timeoutMs =
     async sendMessage(message) {
       messages.push(message); let data = {};
       if (rpcDelays[message.type]) await new Promise(resolve => schedule(resolve, rpcDelays[message.type]));
-      if (message.type === 'bridge:poll') data = { job: messages.filter(m => m.type === 'bridge:poll').length === 1 ? { id: 'lifecycle-job', assistant, platform: 'qq', prompt: 'Question', conversationUrl: urls[assistant], timeoutMs, images: remount === 'input-image-fetch' ? [metadata] : [] } : null };
+      if (message.type === 'bridge:poll') data = { job: offered < queuedJobs ? { id: `lifecycle-job-${++offered}`, assistant, platform: 'qq', prompt: 'Question', conversationUrl: urls[assistant], timeoutMs, images: remount === 'input-image-fetch' ? [metadata] : [] } : null };
+      if (message.type === 'bridge:error') failedState = { text: dom.composerText(currentInput), attachments: dom.hasAttachments(currentInput) };
       if (message.type === 'bridge:input-image') { remountComposer('Human replacement draft'); data = { imageId: metadata.id, mimeType: metadata.mimeType, name: metadata.name, base64: png.toString('base64') }; }
       return { ok: true, data };
     },
@@ -107,7 +118,7 @@ async function fixture(assistant, { remount, action, rpcDelays = {}, timeoutMs =
   win.eval(source); await flush();
   return {
     doc, originalInput, messages,
-    get input() { return currentInput; }, get clicks() { return clicks; }, get remounts() { return remounts; },
+    get input() { return currentInput; }, get clicks() { return clicks; }, get remounts() { return remounts; }, get removals() { return removals; }, get failedState() { return failedState; },
     get result() { return messages.find(m => m.type === 'bridge:result'); }, get error() { return messages.find(m => m.type === 'bridge:error'); },
     wake() { listeners.forEach(listener => listener({ type: 'bridge:wake' }, { id: win.chrome.runtime.id, url: win.chrome.runtime.getURL('worker.js') })); },
     async advance(ms) {
@@ -125,6 +136,36 @@ async function fixture(assistant, { remount, action, rpcDelays = {}, timeoutMs =
 }
 
 for (const assistant of shared.ASSISTANTS) {
+  test(`${assistant} clears existing text and native attachments only when a new task starts`, async () => {
+    const x = await fixture(assistant, { initialDraft: 'Existing draft', initialAttachment: true });
+    try {
+      await x.advance(5000);
+      assert.equal(x.error, undefined); assert.equal(x.result?.text, 'Final answer'); assert.equal(x.clicks, 1); assert.equal(x.removals, 1);
+      assert.equal(adapters[assistant].composerText(x.input), ''); assert.equal(adapters[assistant].hasAttachments(x.input), false);
+    } finally { x.close(); }
+  });
+
+  test(`${assistant} polling without a queued task leaves the draft and attachments untouched`, async () => {
+    const x = await fixture(assistant, { initialDraft: 'Existing draft', initialAttachment: true, queuedJobs: 0 });
+    try {
+      x.wake(); await x.advance(5000);
+      assert.equal(x.error, undefined); assert.equal(x.clicks, 0); assert.equal(x.removals, 0);
+      assert.equal(adapters[assistant].composerText(x.input), 'Existing draft'); assert.equal(adapters[assistant].hasAttachments(x.input), true);
+    } finally { x.close(); }
+  });
+
+  test(`${assistant} clears a failed task's text and attachment before running the next queued task`, async () => {
+    const x = await fixture(assistant, { failFirst: true, queuedJobs: 2 });
+    try {
+      await x.advance(6000);
+      assert.ok(x.error); assert.deepEqual(x.failedState, { text: '', attachments: false });
+      assert.equal(x.removals, 1); assert.equal(x.clicks, 1); assert.equal(x.result?.text, 'Final answer');
+      assert.equal(x.messages.filter(m => m.type === 'bridge:started').length, 2);
+      assert.equal(x.messages.filter(m => m.type === 'bridge:error').length, 1);
+      assert.equal(x.messages.filter(m => m.type === 'bridge:result').length, 1);
+    } finally { x.close(); }
+  });
+
   test(`${assistant} a slow but valid backend acknowledgement does not abort submission or misreport a delivered answer`, async () => {
     for (const type of ['bridge:started', 'bridge:result']) {
       const x = await fixture(assistant, { rpcDelays: { [type]: 18000 } });

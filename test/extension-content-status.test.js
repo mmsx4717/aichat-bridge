@@ -113,7 +113,7 @@ async function fixture(assistant, { blocked, rpcFailure = false, pollResponse = 
 }
 
 for (const assistant of shared.ASSISTANTS) {
-  for (const blocked of ['missing', 'busy', 'draft']) test(`${assistant} clears its transient ${blocked} readiness warning after the composer recovers with no queued job`, async () => {
+  for (const blocked of ['missing', 'busy']) test(`${assistant} clears its transient ${blocked} readiness warning after the composer recovers with no queued job`, async () => {
     const x = await fixture(assistant, { blocked });
     try {
       assert.match(x.badge, /等待网页就绪/); assert.deepEqual(x.messages.map(message => message.type), assistant === 'chatgpt' ? ['bridge:challenge-resume'] : []);

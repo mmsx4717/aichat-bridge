@@ -152,7 +152,7 @@ export function challengeRetryButton(doc, user) {
   const buttons = failure.retryButtons.filter(button => !unavailableControl(button));
   return buttons.length === 1 ? buttons[0] : null;
 }
-export function assertReady(doc) {
+export function assertReady(doc, { allowDraft = false } = {}) {
   assertModelAvailable(doc);
   const lastUser = turns(doc, 'user').at(-1);
   assertNoChallenge(doc, lastUser);
@@ -160,8 +160,8 @@ export function assertReady(doc) {
   const lastAssistant = turns(doc, 'assistant').at(-1);
   if (lastUser && (!lastAssistant || !(lastUser.compareDocumentPosition(lastAssistant) & 4) || !sameModernTurn(lastUser, lastAssistant) || !completedMessage(lastAssistant))) throw new PageSafetyError('上一条网页提问尚未明确完成，请先在网页处理');
   const input = composer(doc);
-  if (hasAttachments(input)) throw new PageSafetyError('输入区存在附件或正在上传，本次不会发送');
-  if (normalizeText(composerText(input))) throw new PageSafetyError('输入框有草稿，本次不会覆盖草稿');
+  if (!allowDraft && hasAttachments(input)) throw new PageSafetyError('输入区存在附件或正在上传，本次不会发送');
+  if (!allowDraft && normalizeText(composerText(input))) throw new PageSafetyError('输入框有草稿，本次不会覆盖草稿');
   return input;
 }
 export function turns(doc, role) {
@@ -478,6 +478,39 @@ export function validateInputImages(value = []) {
 }
 
 const REMOVE_ATTACHMENT = 'button[aria-label*="Remove file"], button[aria-label*="Remove attachment"], button[aria-label*="移除附件"], button[aria-label*="删除文件"], button[aria-label*="移除文件"]';
+
+// Providers supply only their own composer boundary and native remove controls.
+// Use editor events and native buttons so the website clears its application
+// state as well as the visible DOM. Never remove transcript nodes directly.
+export function clearComposerDraft(doc, input, scope, removers, clicked) {
+  if (!input.isConnected || !scope?.isConnected || !scope.contains(input) || unavailableControl(input) || input.readOnly) throw new PageSafetyError('无法清理当前输入区，请检查网页');
+  for (const button of removers) {
+    if (!scope.contains(button) || unavailableControl(button) || clicked.has(button)) continue;
+    clicked.add(button); button.click();
+  }
+  for (const field of scope.querySelectorAll('input[type="file"]')) if (field.files?.length) field.value = '';
+  if (!normalizeText(composerText(input))) return;
+  input.focus();
+  let emitted = false; const onInput = () => { emitted = true; };
+  input.addEventListener('input', onInput, true);
+  try {
+    if (input.tagName === 'TEXTAREA') {
+      Object.getOwnPropertyDescriptor(doc.defaultView.HTMLTextAreaElement.prototype, 'value').set.call(input, '');
+    } else {
+      const range = doc.createRange(); range.selectNodeContents(input);
+      const selection = doc.defaultView.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      if (typeof doc.execCommand !== 'function' || !doc.execCommand('delete', false, null)) throw new PageSafetyError('网页未接受草稿清理，请检查输入框');
+    }
+  } finally { input.removeEventListener('input', onInput, true); }
+  if (!emitted) input.dispatchEvent(new doc.defaultView.InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+  if (normalizeText(composerText(input))) throw new PageSafetyError('网页草稿尚未清空，请检查输入框');
+}
+export function clearDraft(doc, input, clicked = new WeakSet()) {
+  if (composer(doc) !== input) throw new PageSafetyError('清理前 ChatGPT 输入框已变化');
+  const scope = composerScope(input);
+  const removers = [...scope.querySelectorAll('button')].filter(button => button.matches(REMOVE_ATTACHMENT) || /^(?:Remove\s+[“"]|移除[“"])/i.test(button.getAttribute('aria-label') || ''));
+  clearComposerDraft(doc, input, scope, removers, clicked);
+}
 
 // Only accept visibly named, removable attachments created by this run. Unknown preview
 // layouts remain pending and eventually fail; they never enable a text-only submission.

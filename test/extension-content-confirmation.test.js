@@ -48,7 +48,7 @@ async function fixture({ timeoutMs = 240000, image = true } = {}) {
   win.__testDom = { ...dom, findSubmittedUser(...args) { scans++; return dom.findSubmittedUser(...args); } };
   win.DataTransfer = class { constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; } };
   win.ClipboardEvent = class extends win.Event { constructor(type, options) { super(type, options); this.clipboardData = options.clipboardData; } };
-  doc.execCommand = (command, _ui, text) => { assert.equal(command, 'insertText'); input.textContent = text; return true; };
+  doc.execCommand = (command, _ui, text) => { assert.ok(['insertText', 'delete'].includes(command)); input.textContent = command === 'delete' ? '' : text; return true; };
   input.addEventListener('paste', event => {
     pasted++; const file = event.clipboardData.files[0];
     doc.querySelector('[data-composer-attachments]').insertAdjacentHTML('beforeend', `<div data-testid="file-chip"><span>${file.name}</span><button aria-label="Remove attachment"></button></div>`);

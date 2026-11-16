@@ -1,7 +1,7 @@
 import { normalizeText, conversationUrl } from './shared.js';
 export { createObservationRecorder } from './background-observation.js';
 import {
-  PageSafetyError, visible, composerText, markdownText as sharedMarkdown,
+  PageSafetyError, visible, composerText, markdownText as sharedMarkdown, clearComposerDraft,
   validateInputImages, decodeImagePayload, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES,
 } from './dom.js';
 export { PageSafetyError, visible, composerText, validateInputImages, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES };
@@ -174,15 +174,21 @@ export function hasAttachments(input) {
   return [...scope.querySelectorAll('input[type="file"]')].some(field => field.files?.length) ||
     [...scope.querySelectorAll('.file-card-list > *, img, [role="progressbar"], [aria-busy="true"]')].some(visible);
 }
-export function assertReady(doc) {
+export function assertReady(doc, { allowDraft = false } = {}) {
   assertNoDialog(doc);
   if (generating(doc)) throw new PageSafetyError('该对话正在生成回复，请等待完成');
   const lastUser = turns(doc, 'user').at(-1), lastAnswer = turns(doc, 'assistant').at(-1);
   if (lastUser && (!rowOf(lastUser) || !lastAnswer || rowOf(lastUser) !== rowOf(lastAnswer) || !completed(lastAnswer))) throw new PageSafetyError('上一条 Qwen 网页提问尚未明确完成，请先在网页处理');
   const input = composer(doc);
-  if (hasAttachments(input)) throw new PageSafetyError('输入区存在附件或正在上传，本次不会发送');
-  if (normalizeText(composerText(input))) throw new PageSafetyError('输入框有草稿，本次不会覆盖草稿');
+  if (!allowDraft && hasAttachments(input)) throw new PageSafetyError('输入区存在附件或正在上传，本次不会发送');
+  if (!allowDraft && normalizeText(composerText(input))) throw new PageSafetyError('输入框有草稿，本次不会覆盖草稿');
   return input;
+}
+export function clearDraft(doc, input, clicked = new WeakSet()) {
+  if (composer(doc) !== input) throw new PageSafetyError('清理前 Qwen 输入框已变化');
+  const scope = composerScope(input);
+  clearComposerDraft(doc, input, scope, [...scope.querySelectorAll('.file-card-list button.close-button')], clicked);
+  releaseInputImages(input);
 }
 export function sendButton(doc, input) {
   if (composer(doc) !== input) throw new PageSafetyError('Qwen 输入框已被替换，已停止发送');
@@ -205,6 +211,10 @@ export function attachInputImage(doc, input, payload, name) {
   records.set(name, { file, scope, card: null, src: null, beforeCards: new Set(scope.querySelectorAll(ATTACHMENT)), beforeSources: new Set([...scope.querySelectorAll('img')].map(x => x.currentSrc || x.src)) }); uploads.set(input, records);
   field.files = transfer.files;
   if (field.files?.length !== 1 || field.files[0] !== file) throw new PageSafetyError('Qwen 文件选择发生变化，已停止上传');
+  // The current Qwen upload menu sets data-type="file" before opening its
+  // picker. Fresh pages omit it, so selecting bytes alone does not route an
+  // upload. Initialize only the owned native field; never open a file picker.
+  field.setAttribute('data-type', 'file');
   // Qwen consumes the file input's change event and clears the FileList.
   field.dispatchEvent(new win.Event('change', { bubbles: true }));
 }

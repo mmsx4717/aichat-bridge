@@ -10,11 +10,26 @@ const dom = await import(`/extension/${provider === 'chatgpt' ? 'dom' : provider
 const input = dom.composer(document), button = dom.sendButton(document, input);
 const prompt = lateQwen || ['hydrate', 'incomplete'].includes(mode) ? '123' : '第一行\nsecond line';
 const messages = [];
-let clicks = 0, polled = false, sentAt = null, lateMutationAt = null;
+let clicks = 0, offers = 0, sentAt = null, lateMutationAt = null, removals = 0, injected = false;
 const check = (condition, message) => { if (!condition) throw new Error(message); };
 const paragraphs = (element, text) => element.replaceChildren(...text.split('\n').map(line => { const p = document.createElement('p'); p.textContent = line; return p; }));
 const clone = selector => document.querySelector(selector).cloneNode(true);
 const templates = provider === 'claude' ? [clone('[data-perf-row="user"]'), clone('[data-perf-row="assistant"]')] : provider === 'gemini' ? [clone('.conversation-container')] : [];
+function attachment() {
+  const scope = dom.composerScope(input);
+  const card = document.createElement(provider === 'gemini' ? 'gem-media-attachment' : 'div');
+  if (provider === 'qwen') { card.className = 'vision-item-container'; card.innerHTML = '<img alt="stale.png"><button class="close-button" style="visibility:hidden"></button>'; scope.querySelector('.file-card-list').append(card); }
+  else if (provider === 'gemini') { card.innerHTML = '<img alt=""><gem-icon-button class="gem-attachment-close-button"><button aria-label="關閉附件"></button></gem-icon-button>'; scope.prepend(card); }
+  else { card.dataset.testid = 'attachment-preview'; card.innerHTML = '<img alt="stale.png"><button aria-label="Remove attachment"></button>'; scope.prepend(card); }
+  card.querySelector('button').addEventListener('click', () => { removals++; card.remove(); });
+}
+if (mode === 'cleanup-start') {
+  if (input.tagName === 'TEXTAREA') input.value = 'Existing draft'; else input.textContent = 'Existing draft';
+  attachment();
+}
+input.addEventListener('input', () => {
+  if (mode === 'cleanup-failure' && !injected && dom.composerText(input).replace(/\s+/g, ' ').trim() === prompt.replace(/\s+/g, ' ').trim()) { injected = true; attachment(); }
+});
 function mountTurn() {
   let userBody, complete;
   if (provider === 'qwen') {
@@ -79,6 +94,7 @@ button.addEventListener('click', () => {
     clicks++;
     sentAt = performance.now();
     check(dom.composerText(input).replace(/\s+/g, ' ').trim() === prompt.replace(/\s+/g, ' '), 'submitted text differs from job');
+    check(!dom.hasAttachments(input), 'stale attachment survived cleanup');
     if (input.tagName === 'TEXTAREA') input.value = ''; else input.replaceChildren();
     mountTurn();
     if (mode === 'remount') input.replaceWith(input.cloneNode(true));
@@ -89,8 +105,12 @@ window.chrome = { runtime: {
   async sendMessage(message) {
     messages.push(message);
     if (message.type === 'bridge:poll') {
-      const job = polled ? null : { id: 'audit-job', assistant: provider, platform: mode === 'hydrate' ? 'feishu' : 'qq', prompt, conversationUrl: location.origin + location.pathname, timeoutMs: lateQwen ? 45000 : mode === 'incomplete' ? 2500 : 12000, images: [] };
-      polled = true; return { ok: true, data: { job } };
+      const job = offers >= (mode === 'cleanup-failure' ? 2 : 1) ? null : { id: `audit-job-${++offers}`, assistant: provider, platform: mode === 'hydrate' ? 'feishu' : 'qq', prompt, conversationUrl: location.origin + location.pathname, timeoutMs: lateQwen ? 45000 : mode === 'incomplete' ? 2500 : 12000, images: [] };
+      return { ok: true, data: { job } };
+    }
+    if (mode === 'cleanup-failure' && message.type === 'bridge:error') {
+      check(clicks === 0 && !dom.composerText(input).trim() && !dom.hasAttachments(input), 'failed draft not cleared before the next task');
+      return { ok: true, data: {} };
     }
     if (message.type === 'bridge:result' || message.type === 'bridge:error') {
       setTimeout(() => {
@@ -100,7 +120,8 @@ window.chrome = { runtime: {
           if (confirmedQwenIdChange) check(lateMutationAt !== null, 'confirmed Qwen identity must be promoted before forwarding');
           const results = messages.filter(m => m.type === 'bridge:result'), errors = messages.filter(m => m.type === 'bridge:error');
           if (['mismatch', 'incomplete', 'late-mismatch', 'late-row-replacement'].includes(mode)) check(results.length === 0 && errors.length === 1, 'unconfirmed prompt must never be forwarded');
-          else check(errors.length === 0 && results.length === 1 && results[0].text === 'Audit answer', 'expected one complete result: ' + (errors[0]?.error || JSON.stringify(results)));
+          else check(errors.length === (mode === 'cleanup-failure' ? 1 : 0) && results.length === 1 && results[0].text === 'Audit answer', 'expected one complete result: ' + (errors[0]?.error || JSON.stringify(results)));
+          if (mode.startsWith('cleanup-')) check(removals === 1 && !dom.hasAttachments(input) && !dom.composerText(input).trim(), 'native cleanup did not empty the composer');
           window.regressionResult = { provider, mode, clicks, results: results.length, errors: errors.length, ...(lateQwen ? { elapsedMs: Math.round(performance.now() - sentAt) } : {}) };
         } catch (error) { window.regressionResult = { provider, mode, error: error.stack }; }
       }, 50);

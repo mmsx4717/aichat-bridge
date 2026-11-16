@@ -18,13 +18,14 @@ const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
 const metadata = { id: '1'.repeat(64), mimeType: 'image/png', name: 'source.png', bytes: png.length };
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-async function fixture({ assistant = 'claude', image = false, outputImage = false, initialDraft = '', mutation, submittedText, acknowledge = true, renamed = false, wrongBlob = false, imageCount = 1, clearNativeSelection = false, uploadMutation, origin = url } = {}) {
+async function fixture({ assistant = 'claude', image = false, outputImage = false, initialDraft = '', noJob = false, mutation, submittedText, acknowledge = true, renamed = false, wrongBlob = false, imageCount = 1, clearNativeSelection = false, uploadMutation, origin = url } = {}) {
   const page = new JSDOM(html, { url: origin, runScripts: 'outside-only', pretendToBeVisual: true });
   const win = page.window; const doc = win.document; const input = claude.composer(doc);
   const messages = []; const listeners = []; const pasted = []; const uploaded = []; const fileEvents = []; const timers = new Map();
   const fileInput = doc.querySelector('input[data-testid="file-upload"]');
   let selectedFiles = uploadMutation === 'initial-foreign' ? [new win.File([png], 'human.png', { type: 'image/png' })] : [];
   Object.defineProperty(fileInput, 'files', { configurable: true, get() { return selectedFiles; }, set(value) { if (uploadMutation === 'assignment-error') throw new Error('Selection denied'); selectedFiles = [...value]; } });
+  Object.defineProperty(fileInput, 'value', { configurable: true, get() { return ''; }, set(value) { assert.equal(value, ''); selectedFiles = []; } });
   let released = 0; let now = 1000; let serial = 0; let clicks = 0; let readinessChecks = 0; let appDraft = initialDraft; let afterInput = false;
   const schedule = (fn, ms, repeat = 0) => { const id = ++serial; timers.set(id, { fn, at: now + ms, repeat }); return id; };
   input.textContent = initialDraft;
@@ -38,7 +39,12 @@ async function fixture({ assistant = 'claude', image = false, outputImage = fals
   win.__testClaude = { ...claude, releaseInputImages(input) { released++; claude.releaseInputImages?.(input); }, assertReady(...args) { readinessChecks++; return claude.assertReady(...args); }, readAnswerImage: value => claude.readAnswerImage(value, { fetchImpl: async () => new Response(png, { headers: { 'content-type': 'image/png' } }) }) };
   win.DataTransfer = class { constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; } };
   win.ClipboardEvent = class extends win.Event { constructor(type, options) { super(type, options); this.clipboardData = options.clipboardData; } };
-  doc.execCommand = (command, _ui, value) => { assert.equal(command, 'insertText'); input.textContent = value; return true; };
+  doc.execCommand = (command, _ui, value) => { assert.ok(['insertText', 'delete'].includes(command)); input.textContent = command === 'delete' ? '' : value; return true; };
+  doc.addEventListener('click', event => {
+    if (!claude.composerScope(input)?.contains(event.target) || !event.target.matches('button[aria-label*="Remove"], button[data-cds-attachment-remove]')) return;
+    event.target.closest('[data-testid="attachment-preview"], [data-testid="file-thumbnail"]')?.remove();
+    selectedFiles = [];
+  });
   const loadImage = element => Object.defineProperties(element, { complete: { value: true }, naturalWidth: { value: 640 }, naturalHeight: { value: 480 } });
   win.fetch = async source => { assert.ok(source.startsWith('blob:https://claude.ai/')); return new Response(wrongBlob ? Buffer.concat([png, Buffer.from([9])]) : png, { headers: { 'content-type': 'image/png' } }); };
   input.addEventListener('paste', event => { pasted.push(...event.clipboardData.files); });
@@ -71,10 +77,10 @@ async function fixture({ assistant = 'claude', image = false, outputImage = fals
     if (uploadMutation === 'foreign-selection') selectedFiles = [file, new win.File([png], 'human.png', { type: 'image/png' })];
     if (uploadMutation === 'replaced-selection') selectedFiles = [new win.File([png], file.name, { type: 'image/png' })];
   });
-  input.addEventListener('input', () => {
+  input.addEventListener('input', event => {
     afterInput = true; const value = claude.composerText(input);
     schedule(() => { appDraft = value; }, 350);
-    if (mutation) schedule(() => {
+    if (mutation && event.inputType !== 'deleteContentBackward') schedule(() => {
       if (mutation === 'draft') input.textContent = 'A human draft';
       if (mutation === 'navigation') win.history.replaceState({}, '', '/chat/22222222-2222-4222-8222-222222222222');
       if (mutation === 'new-user') doc.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="transcript-row"><div data-testid="user-message">Human question</div></div>');
@@ -96,7 +102,7 @@ async function fixture({ assistant = 'claude', image = false, outputImage = fals
     onMessage: { addListener(listener) { listeners.push(listener); } },
     async sendMessage(message) {
       messages.push(message); let data = {};
-      if (message.type === 'bridge:poll') data = { job: messages.filter(item => item.type === 'bridge:poll').length === 1 ? { id: 'claude-job', assistant, prompt: 'Describe the chart', conversationUrl: url, timeoutMs: 90000, images: image ? Array.from({length:imageCount}, (_, i) => ({...metadata, id:String(i+1).repeat(64)})) : [] } : null };
+      if (message.type === 'bridge:poll') data = { job: !noJob && messages.filter(item => item.type === 'bridge:poll').length === 1 ? { id: 'claude-job', assistant, prompt: 'Describe the chart', conversationUrl: url, timeoutMs: 90000, images: image ? Array.from({length:imageCount}, (_, i) => ({...metadata, id:String(i+1).repeat(64)})) : [] } : null };
       if (message.type === 'bridge:input-image') data = { imageId: message.imageId, mimeType: metadata.mimeType, name: metadata.name, base64: png.toString('base64') };
       if (message.type === 'bridge:image') data = { imageId: '2'.repeat(64) };
       return { ok: true, data };
@@ -146,12 +152,12 @@ test('Claude refuses ChatGPT jobs and unlabeled legacy jobs before any input or 
   }
 });
 
-test('Claude existing drafts block polling and untrusted wakes cannot start a job', async () => {
-  const x = await fixture({ initialDraft: 'Existing private draft' });
+test('Claude idle drafts survive and untrusted wakes cannot start a job', async () => {
+  const x = await fixture({ initialDraft: 'Existing private draft', noJob: true });
   try {
-    assert.equal(x.messages.length, 0); const checks = x.readinessChecks;
+    assert.equal(x.messages.some(m => m.type === 'bridge:started'), false); const checks = x.readinessChecks;
     x.wake({ id: 'other-extension' }); await flush(); assert.equal(x.readinessChecks, checks);
-    x.wake(); await flush(); assert.equal(x.messages.length, 0);
+    x.wake(); await flush(); assert.equal(x.messages.some(m => m.type === 'bridge:started'), false);
     assert.equal(claude.composerText(x.input), 'Existing private draft'); assert.equal(x.clicks, 0);
   } finally { x.close(); }
 });
@@ -161,7 +167,7 @@ test('Claude draft, navigation, attachment and extra user changes during settlin
     const x = await fixture({ mutation });
     try {
       await x.advance(1000); assert.equal(x.clicks, 0, mutation); assert.ok(x.error, mutation); assert.equal(x.result, undefined);
-      assert.equal(claude.composerText(x.input), mutation === 'draft' ? 'A human draft' : 'Describe the chart');
+      assert.equal(claude.composerText(x.input), mutation === 'navigation' ? 'Describe the chart' : '');
     } finally { x.close(); }
   }
 });
@@ -180,7 +186,7 @@ test('Claude mismatched submitted user text is never retried or paired with an a
   try {
     await x.advance(1500); x.wake(); await x.advance(5000);
     assert.equal(x.clicks, 1); assert.equal(x.result, undefined); assert.match(x.error.error, /新增网页消息与本次群消息不同/);
-    assert.equal(claude.composerText(x.input), 'Describe the chart');
+    assert.equal(claude.composerText(x.input), '');
   } finally { x.close(); }
 });
 
@@ -293,11 +299,11 @@ test('Claude input-event selection clearing is neither restored nor retried with
   } finally { x.close(); }
 });
 
-test('Claude existing native file selections block leasing and remain untouched', async () => {
+test('Claude clears an existing native file selection before preparing the new task image', async () => {
   const x = await fixture({ image: true, uploadMutation: 'initial-foreign' });
   try {
-    await x.advance(1500);
-    assert.equal(x.messages.length, 0); assert.equal(x.fileEvents.length, 0); assert.equal(x.uploaded.length, 0); assert.equal(x.pasted.length, 0);
-    assert.equal(x.selectedFiles[0].name, 'human.png'); assert.equal(x.clicks, 0);
+    await x.advance(3000);
+    assert.equal(x.error, undefined); assert.equal(x.fileEvents.length, 2); assert.equal(x.uploaded.length, 1); assert.equal(x.pasted.length, 0);
+    assert.equal(x.selectedFiles.length, 0); assert.equal(x.clicks, 1); assert.equal(x.result?.text, 'Claude final answer');
   } finally { x.close(); }
 });

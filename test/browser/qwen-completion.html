@@ -67,6 +67,9 @@ try {
     const input = dom.composer(document), field = document.querySelector('#filesUpload');
     const names = []; let events = 0, latestImage;
     field.addEventListener('change', () => {
+      // The new upload menu initializes data-type="file" before choosing files.
+      // A fresh page has no type and does not create an attachment.
+      if (field.dataset.type !== 'file') { field.value = ''; return; }
       events++;
       const file = field.files[0]; check(file instanceof File && file.size === bytes.length, 'native file payload');
       const card = document.createElement('div'); card.className = 'vision-item-container';
@@ -78,8 +81,10 @@ try {
     for (let index = 1; index <= count; index++) {
       const name = 'bridge-audit-' + index + '.png';
       dom.attachInputImage(document, input, payload, name); names.push(name);
+      check(Boolean(latestImage), 'first upload needs no prior manual menu selection');
       await latestImage.decode();
       check(dom.inputAttachmentState(input, names).ready, 'native upload ready');
+      field.removeAttribute('data-type'); latestImage = null;
     }
     check(events === count, 'one file change per image');
     const replacement = input.cloneNode(true); input.replaceWith(replacement);

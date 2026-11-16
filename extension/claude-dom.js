@@ -1,8 +1,8 @@
 import { normalizeText } from './shared.js';
-// Shared helpers read text and validate image bytes only. Claude never uses ChatGPT's
-// composer, turn attribution, completion selectors, or image-source allowlist.
+// Shared helpers read text, validate image bytes and clear native editor state.
+// Claude owns its composer, attachment, turn and completion selectors.
 import {
-  PageSafetyError, visible, composerText, markdownText,
+  PageSafetyError, visible, composerText, markdownText, clearComposerDraft,
   validateInputImages, decodeImagePayload, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES,
 } from './dom.js';
 export { PageSafetyError, visible, composerText, markdownText, validateInputImages, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES };
@@ -143,15 +143,21 @@ export function hasAttachments(input) {
   if (removableButtons(scope).length) return true;
   return [...scope.querySelectorAll(`img, ${PREVIEW}, [role="progressbar"], [aria-busy="true"]`)].some(node => visible(node) && (node.tagName === 'IMG' || node.matches('[role="progressbar"], [aria-busy="true"]') || node.childElementCount || normalizeText(node.textContent)));
 }
-export function assertReady(doc) {
+export function assertReady(doc, { allowDraft = false } = {}) {
   if ([...doc.querySelectorAll('#challenge-running, #challenge-stage, iframe[src*="challenges.cloudflare.com"]')].some(visible)) throw new PageSafetyError('网页正在验证，请先手动完成验证');
   if (generating(doc)) throw new PageSafetyError('该对话正在生成回复，请等待完成');
   const lastUser = turns(doc, 'user').at(-1); const lastAssistant = turns(doc, 'assistant').at(-1);
   if (lastUser && (!messageRow(lastUser) || !lastAssistant || !(lastUser.compareDocumentPosition(lastAssistant) & 4) || !completedMessage(lastAssistant))) throw new PageSafetyError('上一条 Claude 网页提问尚未明确完成，请先在网页处理');
   const input = composer(doc);
-  if (hasAttachments(input)) throw new PageSafetyError('输入区存在附件或正在上传，本次不会发送');
-  if (normalizeText(composerText(input))) throw new PageSafetyError('输入框有草稿，本次不会覆盖草稿');
+  if (!allowDraft && hasAttachments(input)) throw new PageSafetyError('输入区存在附件或正在上传，本次不会发送');
+  if (!allowDraft && normalizeText(composerText(input))) throw new PageSafetyError('输入框有草稿，本次不会覆盖草稿');
   return input;
+}
+export function clearDraft(doc, input, clicked = new WeakSet()) {
+  if (composer(doc) !== input) throw new PageSafetyError('清理前 Claude 输入框已变化');
+  const scope = attachmentScope(input);
+  clearComposerDraft(doc, input, scope, [...scope.querySelectorAll(`${REMOVE}, button[data-cds-attachment-remove]`)], clicked);
+  releaseInputImages(input);
 }
 export function sendButton(doc, input) {
   if (composer(doc) !== input) throw new PageSafetyError('Claude 输入框已被替换，已停止发送');

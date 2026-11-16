@@ -39,15 +39,16 @@ async function runFixture({ acknowledge = true, uploadError = false, changeDraft
   win.__testShared = shared;
   win.DataTransfer = class { constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; } };
   win.ClipboardEvent = class extends win.Event { constructor(type, options) { super(type, options); this.clipboardData = options.clipboardData; } };
-  doc.execCommand = (command, _ui, text) => { assert.equal(command, 'insertText'); input.textContent = text; return true; };
-  input.addEventListener('input', () => {
+  doc.execCommand = (command, _ui, text) => { assert.ok(['insertText', 'delete'].includes(command)); input.textContent = command === 'delete' ? '' : text; return true; };
+  doc.addEventListener('click', event => { if (event.target.matches('button[aria-label="Remove attachment"]')) event.target.closest('[data-testid="file-chip"]')?.remove(); });
+  input.addEventListener('input', event => {
     // A controlled editor renders DOM immediately but its submit handler reads
     // separately committed state. An enabled attachment button does not prove
     // this state has caught up. Model both microtask and delayed task commits.
     const value = dom.composerText(input); inputAt = now;
     if (commitDelay) pending.push({ at: now + commitDelay, run: () => { appDraft = value; } });
     else queueMicrotask(() => { appDraft = value; });
-    if (duringSettle) pending.push({ at: now + 200, run: () => {
+    if (duringSettle && event.inputType !== 'deleteContentBackward') pending.push({ at: now + 200, run: () => {
       if (duringSettle === 'draft') input.textContent = 'A later human draft';
       if (duringSettle === 'attachment') doc.querySelector('[data-composer-attachments]').textContent = '';
       if (duringSettle === 'navigation') win.history.replaceState({}, '', '/c/a-different-conversation');
@@ -143,7 +144,7 @@ test('draft, attachments, conversation or user-turn changes while the editor set
     const result = await runFixture({ duringSettle, commitDelay: 350 });
     assert.equal(result.clicks, 0, duringSettle);
     assert.equal(result.result.type, 'bridge:error');
-    assert.equal(result.draft, duringSettle === 'draft' ? 'A later human draft' : 'Describe the picture');
+    assert.equal(result.draft, duringSettle === 'navigation' ? 'Describe the picture' : '');
   }
 });
 
@@ -154,12 +155,12 @@ test('a send button replaced by the editor is reacquired after settling', async 
   assert.ok(result.settleTime >= 700);
 });
 
-test('an unexpectedly image-only submitted turn fails once and preserves the unsent text', async () => {
+test('an unexpectedly image-only submitted turn fails once and clears the unsent text', async () => {
   const result = await runFixture({ submittedText: '' });
   assert.equal(result.result.type, 'bridge:error');
   assert.match(result.result.error, /未确认到本次网页消息/);
   assert.equal(result.clicks, 1);
-  assert.equal(result.draft, 'Describe the picture');
+  assert.equal(result.draft, '');
 });
 
 test('the observed generated gallery reaches image upload and final result without a normal assistant marker', async () => {
@@ -214,10 +215,10 @@ test('supported reply image failures still stop delivery even beside omitted ext
   assert.deepEqual(result.outputReads, [generatedImageUrl]);
 });
 
-test('a changed draft during image preparation survives and blocks the single send', async () => {
+test('a changed draft during image preparation blocks send and is cleared on failure', async () => {
   const result = await runFixture({ changeDraft: true });
   assert.equal(result.clicks, 0);
   assert.equal(result.result.type, 'bridge:error');
   assert.match(result.result.error, /页面内容已变化/);
-  assert.equal(result.draft, 'A human draft that must survive');
+  assert.equal(result.draft, '');
 });

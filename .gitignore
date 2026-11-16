@@ -1,5 +1,6 @@
 node_modules/
 dist/
+reports/
 .DS_Store
 .data/
 .env

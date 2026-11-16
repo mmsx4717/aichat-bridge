@@ -23,7 +23,7 @@ const metadata = { id: '1'.repeat(64), mimeType: 'image/png', name: 'source.png'
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 
-async function fixture({ assistant = 'gemini', initialDraft = '', mutation, submittedText, origin = url, pollGate, imageCount = 0, acknowledge = false, wrongBlob = false, extraAttachment = false, originalBytes = png, previewBytes = originalBytes, inputMimeType = 'image/png', previewMimeType = inputMimeType, hiddenClose = false, decoder, decoderGate, outputHtml = '<p>Gemini final answer</p>', outputImages = [], generatedOutput = false, afterSend, afterSendMs = 200, pendingForMs = null, pendingInitialText = 'ready', pendingTextAfterMs = Infinity, pendingIndicators = 'visible', streamForMs = 0, timeoutMs = 90000 } = {}) {
+async function fixture({ assistant = 'gemini', initialDraft = '', noJob = false, mutation, submittedText, origin = url, pollGate, imageCount = 0, acknowledge = false, wrongBlob = false, extraAttachment = false, originalBytes = png, previewBytes = originalBytes, inputMimeType = 'image/png', previewMimeType = inputMimeType, hiddenClose = false, decoder, decoderGate, outputHtml = '<p>Gemini final answer</p>', outputImages = [], generatedOutput = false, afterSend, afterSendMs = 200, pendingForMs = null, pendingInitialText = 'ready', pendingTextAfterMs = Infinity, pendingIndicators = 'visible', streamForMs = 0, timeoutMs = 90000 } = {}) {
   const page = new JSDOM(html, { url: origin, runScripts: 'outside-only', pretendToBeVisual: true });
   const win = page.window; const doc = win.document; const input = gemini.composer(doc);
   const messages = []; const listeners = []; const pasted = []; const timers = new Map(); const jobs = [];
@@ -69,7 +69,10 @@ async function fixture({ assistant = 'gemini', initialDraft = '', mutation, subm
     previewReads.push(source);
     return new Response(wrongBlob ? Buffer.concat([previewBytes, Buffer.from([9])]) : previewBytes, { headers: { 'content-type': previewMimeType } });
   };
-  doc.execCommand = (command, _ui, value) => { assert.equal(command, 'insertText'); input.textContent = value; return true; };
+  doc.execCommand = (command, _ui, value) => { assert.ok(['insertText', 'delete'].includes(command)); input.textContent = command === 'delete' ? '' : value; return true; };
+  doc.addEventListener('click', event => {
+    if (event.target.matches('.gem-attachment-close-button > button')) event.target.closest('.file-preview-container')?.remove();
+  });
   const loadImage = element => Object.defineProperties(element, { complete: { value: true }, naturalWidth: { value: 640 }, naturalHeight: { value: 480 } });
   let history = doc.querySelector('main');
   if (pendingForMs !== null) {
@@ -106,15 +109,15 @@ async function fixture({ assistant = 'gemini', initialDraft = '', mutation, subm
     gemini.composerScope(input).prepend(card);
     if (extraAttachment) gemini.composerScope(input).insertAdjacentHTML('afterbegin', '<img alt="private.png" src="blob:https://gemini.google.com/extra-private-image">');
   });
-  input.addEventListener('input', () => {
+  input.addEventListener('input', event => {
     afterInput = true; const value = gemini.composerText(input);
     schedule(() => { appDraft = value; }, 350);
-    if (mutation) schedule(() => {
+    if (mutation && event.inputType !== 'deleteContentBackward') schedule(() => {
       if (mutation === 'draft') input.textContent = 'A human draft';
       if (mutation === 'human') { input.textContent = 'A human draft'; guards.get('input')?.({ type: 'input', isTrusted: true, target: input }); }
       if (mutation === 'navigation') win.history.replaceState({}, '', '/u/1/app/a-different-conversation');
       if (mutation === 'new-user') appendTurn('Human question', '<p>Unrelated answer</p>');
-      if (mutation === 'attachment') gemini.composerScope(input).insertAdjacentHTML('afterbegin', '<div><img src="blob:https://gemini.google.com/private" alt="private.png"><button aria-label="Remove attachment"></button></div>');
+      if (mutation === 'attachment') gemini.composerScope(input).insertAdjacentHTML('afterbegin', '<div class="file-preview-container"><gem-media-attachment><img src="blob:https://gemini.google.com/private" alt="private.png"><gem-icon-button class="gem-attachment-close-button"><button aria-label="關閉附件"></button></gem-icon-button></gem-media-attachment></div>');
     }, 200);
   });
   gemini.sendButton(doc, input).addEventListener('click', () => {
@@ -173,7 +176,7 @@ async function fixture({ assistant = 'gemini', initialDraft = '', mutation, subm
       }
     }, afterSendMs);
   });
-  jobs.push({ id: 'gemini-job', assistant, prompt, conversationUrl: url, timeoutMs,
+  if (!noJob) jobs.push({ id: 'gemini-job', assistant, prompt, conversationUrl: url, timeoutMs,
     images: Array.from({ length: imageCount }, (_, i) => ({ ...inputMetadata, id: String(i + 1).repeat(64) })) });
   win.chrome = { runtime: {
     id: 'gemini-content-fixture', getURL: path => `chrome-extension://gemini-content-fixture/${path}`,
@@ -254,13 +257,13 @@ test('Gemini-looking DOM on an unsupported origin cannot poll or act', async () 
   }
 });
 
-test('Gemini existing drafts survive wake and lifecycle notifications without leasing work', async () => {
-  const x = await fixture({ initialDraft: 'Existing private draft' });
+test('Gemini existing drafts survive idle notifications when no job is queued', async () => {
+  const x = await fixture({ initialDraft: 'Existing private draft', noJob: true });
   try {
-    assert.equal(x.messages.length, 0); const checks = x.readinessChecks;
+    assert.equal(x.messages.some(m => m.type === 'bridge:started'), false); const checks = x.readinessChecks;
     x.wake({ id: 'other-extension' }); await flush(); assert.equal(x.readinessChecks, checks);
     x.wake(); x.doc.dispatchEvent(new x.win.Event('resume')); x.win.dispatchEvent(new x.win.Event('focus')); await x.advance(5000);
-    assert.equal(x.messages.length, 0); assert.equal(gemini.composerText(x.input), 'Existing private draft'); assert.equal(x.clicks, 0);
+    assert.equal(x.messages.some(m => m.type === 'bridge:started'), false); assert.equal(gemini.composerText(x.input), 'Existing private draft'); assert.equal(x.clicks, 0);
   } finally { x.close(); }
 });
 
@@ -269,18 +272,18 @@ test('Gemini settling blocks draft, trusted human edits, navigation, extra attac
     const x = await fixture({ mutation });
     try {
       await x.advance(1000); assert.equal(x.clicks, 0, mutation); assert.ok(x.error, mutation); assert.equal(x.result, undefined);
-      assert.equal(gemini.composerText(x.input), ['draft', 'human'].includes(mutation) ? 'A human draft' : prompt);
+      assert.equal(gemini.composerText(x.input), mutation === 'human' ? 'A human draft' : mutation === 'navigation' ? prompt : '');
       if (mutation === 'human') assert.match(x.error.error, /人工操作/);
     } finally { x.close(); }
   }
 });
 
-test('Gemini submitted text mismatch stops after one click and preserves the unsent draft', async () => {
+test('Gemini submitted text mismatch stops after one click and clears the unsent draft', async () => {
   const x = await fixture({ submittedText: 'Different question' });
   try {
     await x.advance(1500); x.wake(); await x.advance(5000);
     assert.equal(x.clicks, 1); assert.equal(x.result, undefined); assert.match(x.error.error, /新增网页消息与本次群消息不同/);
-    assert.equal(gemini.composerText(x.input), prompt);
+    assert.equal(gemini.composerText(x.input), '');
   } finally { x.close(); }
 });
 
@@ -396,7 +399,7 @@ test('Gemini altered clipboard bytes or an extra attachment never authorize a pa
   for (const options of [{ wrongBlob: true }, { extraAttachment: true }]) {
     const x = await fixture({ imageCount: 2, acknowledge: true, ...options });
     try {
-      await x.advance(61000); assert.equal(x.clicks, 0); assert.equal(x.afterInput, false);
+      await x.advance(66000); assert.equal(x.clicks, 0); assert.equal(x.afterInput, false);
       assert.equal(x.pasted.length, 1); assert.ok(x.error); assert.equal(x.result, undefined); assert.equal(x.released, 1);
     } finally { x.close(); }
   }
@@ -588,8 +591,8 @@ test('Gemini asynchronously mounted nonmatching pending text fails immediately e
     const x = await fixture({ pendingForMs: Infinity, pendingInitialText: 'missing', pendingTextAfterMs: 1000, pendingIndicators, submittedText: 'A different submitted question' });
     try {
       await x.advance(700); await x.advance(999); assert.equal(x.error, undefined); assert.equal(x.result, undefined);
-      await x.advance(1); assert.match(x.error?.error || '', /新增网页消息与本次群消息不同/);
-      assert.equal(x.result, undefined); assert.equal(x.clicks, 1); assert.equal(gemini.composerText(x.input), prompt);
+      await x.advance(101); assert.match(x.error?.error || '', /新增网页消息与本次群消息不同/);
+      assert.equal(x.result, undefined); assert.equal(x.clicks, 1); assert.equal(gemini.composerText(x.input), '');
       assert.equal(x.messages.filter(m => m.type === 'bridge:error').length, 1);
     } finally { x.close(); }
   }

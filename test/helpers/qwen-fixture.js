@@ -23,10 +23,13 @@ export function attachment(doc,name,source=`https://qwen-webui-prod.oss-accelera
   const card=doc.createElement('div');card.className='vision-item-container';card.innerHTML='<div class="media"><div class="vision-item-content"><img class="vision-item-image"></div></div><button class="close-button" aria-label="删除文件" style="visibility:hidden"></button>';
   const img=card.querySelector('img');img.alt=name;img.src=source;loaded(img);doc.querySelector('.file-card-list').append(card);return card;
 }
-export function fileHarness(win, onChange=()=>{}) {
+export function fileHarness(win, onChange=()=>{}, { requireUploadType = false } = {}) {
   let files=[];const field=win.document.querySelector('#filesUpload');
   Object.defineProperty(field,'files',{get:()=>files,set:value=>{files=[...value];},configurable:true});
   win.DataTransfer=class { constructor(){this.files=[];this.items={add:file=>this.files.push(file)};} };
-  field.addEventListener('change',()=>onChange(files));
+  field.addEventListener('change',()=>{
+    if (requireUploadType && field.dataset.type !== 'file') { files = []; return; }
+    onChange(files);
+  });
   return {field, get files(){return files;}, set files(value){files=value;}};
 }

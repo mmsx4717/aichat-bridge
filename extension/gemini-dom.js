@@ -1,9 +1,9 @@
 import { normalizeText } from './shared.js';
 import { imagesVisuallyMatch } from './image-equivalence.js';
-// Text reading and byte validation are shared. Editing, selectors, turn
-// ownership and completion signals belong to this Gemini adapter.
+// Text reading, byte validation and native draft deletion are shared. Gemini
+// owns its input events, selectors, turn ownership and completion signals.
 import {
-  PageSafetyError, visible, composerText, markdownText,
+  PageSafetyError, visible, composerText, markdownText, clearComposerDraft,
   validateInputImages, decodeImagePayload, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES,
 } from './dom.js';
 export { PageSafetyError, visible, composerText, markdownText, validateInputImages, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES };
@@ -132,7 +132,10 @@ function clipboardCard(card) {
   // The close control is hover-only presentation and may be unmounted. It is
   // never clicked or used as attachment identity; the card, image and verified
   // source establish ownership independently of that control's visibility.
-  if (chips.length !== 1 || images.length !== 1 || !visible(images[0]) || !chips[0].contains(images[0]) || !images[0].matches('img.gem-attachment-style-img[alt="attachment"]')) return null;
+  // Gemini now renders alt="" (previously "attachment"). Accessibility text
+  // does not identify an upload; the native structure and registered image
+  // bytes below do, including after a preview has been re-encoded.
+  if (chips.length !== 1 || images.length !== 1 || !visible(images[0]) || !chips[0].contains(images[0]) || !images[0].matches('img.gem-attachment-style-img')) return null;
   return { image: images[0], src: images[0].currentSrc || images[0].src };
 }
 function assertClipboardIdentity(record, scope) {
@@ -254,16 +257,22 @@ export function releaseInputImages(input) {
   for (const record of records.values()) { record.active = false; record.controller?.abort(); record.bytes = null; }
   pastedImages.delete(input);
 }
-export function assertReady(doc) {
+export function assertReady(doc, { allowDraft = false } = {}) {
   assertNoDialog(doc);
   if ([...doc.querySelectorAll('#challenge-running, #challenge-stage, iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"]')].some(visible)) throw new PageSafetyError('网页正在验证，请先手动完成验证');
   if (generating(doc)) throw new PageSafetyError('该对话正在生成回复，请等待完成');
   const lastUser = turns(doc, 'user').at(-1); const lastAssistant = turns(doc, 'assistant').at(-1);
   if (lastUser && (!lastAssistant || messageRow(lastUser) !== messageRow(lastAssistant) || !(lastUser.compareDocumentPosition(lastAssistant) & 4) || !completedMessage(lastAssistant))) throw new PageSafetyError('上一条 Gemini 网页提问尚未明确完成，请先在网页处理');
   const input = composer(doc);
-  if (hasAttachments(input)) throw new PageSafetyError('输入区存在附件或正在上传，本次不会发送');
-  if (normalizeText(composerText(input))) throw new PageSafetyError('输入框有草稿，本次不会覆盖草稿');
+  if (!allowDraft && hasAttachments(input)) throw new PageSafetyError('输入区存在附件或正在上传，本次不会发送');
+  if (!allowDraft && normalizeText(composerText(input))) throw new PageSafetyError('输入框有草稿，本次不会覆盖草稿');
   return input;
+}
+export function clearDraft(doc, input, clicked = new WeakSet()) {
+  if (composer(doc) !== input) throw new PageSafetyError('清理前 Gemini 输入框已变化');
+  const scope = composerScope(input);
+  clearComposerDraft(doc, input, scope, [...scope.querySelectorAll(ATTACHMENT_REMOVE)], clicked);
+  releaseInputImages(input);
 }
 export function sendButton(doc, input) {
   if (composer(doc) !== input) throw new PageSafetyError('Gemini 输入框已被替换，已停止发送');
